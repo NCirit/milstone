@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Milstone Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar"></aside>
+      <main id="main"></main>
+    </div>
+    <div id="modals"></div>
+    <div id="toast" class="toast hidden"></div>
+    <script>
+      window.MILSTONE_CONFIG = {
+        apiBase: window.location.origin
+      };
+    </script>
+    <script src="{{ url_for('static', filename='js/app.js') }}" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+[project]
+name = "milstone"
+version = "0.1.0"
+description = "CLI and web tool for managing project milestones"
+readme = "README.md"
+authors = [
+  { name = "Milstone Authors" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+  "typer>=0.12.3",
+  "rich>=13.7",
+  "sqlalchemy>=2.0",
+  "flask>=3.0",
+]
+
+[project.scripts]
+milstone = "milstone.cli:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+milstone = [
+  "templates/*.html",
+  "static/css/*.css",
+  "static/js/*.js",
+  "data/*.txt"
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }

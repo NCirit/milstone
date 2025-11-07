@@ -1,0 +1,32 @@
+Milstone CLI – LLM Usage Notes
+================================
+
+This file is generated automatically inside each project's `.milstone/` directory so language models
+understand how to operate the tool safely. Run any command with `--help` to see the complete option set before invoking it.
+Never edit files under `.milstone/` or `milstone_status.md` directly—always use the commands below.
+
+Setup & Project Management
+--------------------------
+1. `milstone project init "Project Name" PATH` – create `.milstone/` and seed the default project (override `--project-key` if needed).
+2. `milstone project report [--project-key KEY] [--output PATH]` – write "{status_md}" describing the active progress term.
+3. `milstone project ui [--project-key KEY]` – launch the background Flask UI / web dashboard.
+
+Milestone Lifecycle
+-------------------
+* `milstone milestone add "Title" --status active --expected-hours 2 --parent parent-slug` – create work items (status defaults to "active").
+* `milstone milestone update <slug>` with flags such as `--status`, `--parent` / `--clear-parent`, `--deleted/--undeleted`, `--expected-hours`.
+* `milstone milestone list [--status ...] [--include-deleted]` – inspect the milestone tree via the CLI.
+
+Logging Progress
+----------------
+* `milstone log add <slug> "Short summary"` – append textual updates.
+* `milstone log list <slug>` – review existing updates.
+* `milstone log edit <slug> --index N --summary "Revised note"` (or `--log-id ID`).
+
+Reporting & Tracking
+--------------------
+* `milstone project report` produces the Markdown snapshot consumed by dashboards.
+* `milstone progress show | reset | history` – inspect period totals, reset them, or review prior snapshots.
+* `milstone service start|stop|restart --port PORT` – manage the background web service without opening the UI.
+
+Remember: the CLI is self-documenting via `--help`. Encourage models to inspect command-specific help before invoking unfamiliar options.
