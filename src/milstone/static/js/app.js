@@ -12,6 +12,28 @@ const state = {
   progress: null,
   expanded: new Set(),
   statusFilter: 'all',
+  recentChanges: [],
+  lastChangeIds: new Set(),
+  pollingInterval: null,
+};
+
+// Create notification sound using Web Audio API
+const createNotificationSound = () => {
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const oscillator = audioContext.createOscillator();
+  const gainNode = audioContext.createGain();
+
+  oscillator.connect(gainNode);
+  gainNode.connect(audioContext.destination);
+
+  oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+  oscillator.frequency.exponentialRampToValueAtTime(600, audioContext.currentTime + 0.1);
+
+  gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+  gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.2);
+
+  oscillator.start(audioContext.currentTime);
+  oscillator.stop(audioContext.currentTime + 0.2);
 };
 
 const sidebarEl = document.getElementById('sidebar');
@@ -152,7 +174,6 @@ const templates = {
         <div class="project-btn__header">
           <div>
             <strong>${project.name || project.key}</strong>
-            <small>${project.key}</small>
           </div>
           ${project.path ? `<span class="project-path">${project.path}</span>` : ''}
         </div>
@@ -251,6 +272,48 @@ const loadMilestones = async () => {
   state.progress = data.progress || null;
 };
 
+const loadRecentChanges = async (silent = false) => {
+  if (!state.currentProject) {
+    state.recentChanges = [];
+    return;
+  }
+  const data = await fetchJSON(`/api/recent-changes?project=${encodeURIComponent(state.currentProject)}&limit=20`);
+  const newChanges = data.changes || [];
+
+  // Detect new changes by comparing IDs
+  if (!silent && state.lastChangeIds.size > 0) {
+    const newChangeIds = new Set(newChanges.map(c => c.id));
+    const hasNewChanges = newChanges.some(c => !state.lastChangeIds.has(c.id));
+
+    if (hasNewChanges) {
+      // Play notification sound
+      try {
+        createNotificationSound();
+      } catch (err) {
+        console.log('Could not play notification sound:', err);
+      }
+
+      // Mark new items for highlight animation
+      newChanges.forEach(change => {
+        if (!state.lastChangeIds.has(change.id)) {
+          change.isNew = true;
+        }
+      });
+
+      // Update the recent changes section with animation
+      state.recentChanges = newChanges;
+      updateRecentChangesSection();
+    } else {
+      state.recentChanges = newChanges;
+    }
+  } else {
+    state.recentChanges = newChanges;
+  }
+
+  // Update tracked IDs
+  state.lastChangeIds = new Set(newChanges.map(c => c.id));
+};
+
 const annotateTotals = (nodes) => {
   const calc = (node) => {
     const children = node.children || [];
@@ -333,6 +396,7 @@ const renderMain = () => {
       </div>
     </section>
     ${renderProgressSection(percent)}
+    ${renderRecentChangesSection()}
     ${renderMilestoneSection(tree)}
   `;
 };
@@ -380,6 +444,72 @@ function renderProgressSection(percent) {
   `;
 }
 
+function renderRecentChangesSection() {
+  if (!state.recentChanges || state.recentChanges.length === 0) {
+    return '';
+  }
+
+  const getEventIcon = (eventType) => {
+    switch (eventType) {
+      case 'created': return '✨';
+      case 'status': return '🔄';
+      case 'log': return '📝';
+      default: return '•';
+    }
+  };
+
+  const changesHtml = state.recentChanges.map((change) => {
+    const timestamp = change.createdAt ? new Date(change.createdAt).toLocaleString() : '';
+    const newClass = change.isNew ? ' new-change' : '';
+    const icon = getEventIcon(change.eventType);
+
+    return `
+      <div class="change-item${newClass}">
+        <div class="change-content">
+          <div class="change-summary">
+            <span class="change-icon">${icon}</span>
+            ${escapeHtml(change.summary)}
+          </div>
+          <div class="change-meta">
+            <span class="change-time">${timestamp}</span>
+            ${change.milestone ? `
+              <span class="change-separator">•</span>
+              <a href="#" class="change-milestone-link" data-slug="${escapeHtml(change.milestone.slug)}">
+                ${escapeHtml(change.milestone.title)}
+              </a>
+            ` : ''}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <section class="recent-changes-section">
+      <div class="section-header">
+        <h3>Recent Changes</h3>
+        <p>Latest updates across all milestones</p>
+      </div>
+      <div class="recent-changes-list">
+        ${changesHtml}
+      </div>
+    </section>
+  `;
+}
+
+function updateRecentChangesSection() {
+  const section = $('.recent-changes-section');
+  if (!section) return;
+
+  const newHtml = renderRecentChangesSection();
+  const tempDiv = document.createElement('div');
+  tempDiv.innerHTML = newHtml;
+  const newSection = tempDiv.firstElementChild;
+
+  if (newSection) {
+    section.replaceWith(newSection);
+  }
+}
+
 function renderMilestoneSection(tree) {
   const options = STATUS_FILTERS.map(
     (opt) => `<option value="${opt.value}" ${state.statusFilter === opt.value ? 'selected' : ''}>${opt.label}</option>`
@@ -409,7 +539,7 @@ const renderTree = (nodes) => {
         .map(
           (node) => `
             <li>
-              <div class="node ${node.deleted ? 'deleted' : ''}">
+              <div class="node ${node.deleted ? 'deleted' : ''}" data-slug="${node.slug}">
                 <div class="node-header">
                   <div class="node-title">
                     ${renderStatusDot(node)}
@@ -629,6 +759,7 @@ const handleCreate = async (event) => {
     showToast(`Milestone created (slug: ${res.slug}).`);
     closeModal();
     await loadMilestones();
+    await loadRecentChanges();
     state.snapshots = [];
     renderMain();
   } catch (error) {
@@ -784,6 +915,7 @@ const handleLogSubmit = async (event, isEdit) => {
     showToast(isEdit ? 'Log updated.' : 'Log added.');
     closeModal();
     await loadMilestones();
+    await loadRecentChanges();
     renderMain();
   } catch (error) {
     showToast(error.message);
@@ -794,9 +926,20 @@ sidebarEl.addEventListener('click', async (event) => {
   const btn = event.target.closest('[data-project]');
   if (btn) {
     state.currentProject = btn.dataset.project;
+    // Update URL to reflect current project
+    const url = new URL(window.location.href);
+    url.searchParams.set('project', state.currentProject);
+    window.history.pushState({}, '', url);
+    // Reset change tracking for new project
+    state.lastChangeIds = new Set();
+    // Load project data
     await loadMilestones();
+    await loadRecentChanges(true); // silent on project switch
     state.snapshots = [];
+    renderSidebar(); // Re-render sidebar to update active state
     renderMain();
+    // Restart polling for new project
+    startRecentChangesPolling();
     return;
   }
   if (event.target.matches('[data-action="refresh-projects"]')) {
@@ -805,6 +948,70 @@ sidebarEl.addEventListener('click', async (event) => {
 });
 
 mainEl.addEventListener('click', (event) => {
+  // Handle milestone link clicks from recent changes (check target or closest parent)
+  const milestoneLink = event.target.closest('.change-milestone-link');
+  if (milestoneLink) {
+    event.preventDefault();
+    event.stopPropagation();
+    const slug = milestoneLink.dataset.slug;
+
+    if (!slug) {
+      console.warn('No slug found on milestone link');
+      return;
+    }
+
+    const milestone = findMilestoneBySlug(slug);
+    if (!milestone) {
+      showToast('Milestone not found');
+      return;
+    }
+
+    // Expand the milestone and any parents
+    state.expanded.add(slug);
+
+    // If it has a parent, expand the parent too
+    if (milestone.parentId) {
+      const index = buildNodeIndex(state.milestones, new Map());
+      let current = milestone;
+      while (current && current.parentId) {
+        const parent = index.get(current.parentId);
+        if (parent) {
+          state.expanded.add(parent.slug);
+          current = parent;
+        } else {
+          break;
+        }
+      }
+    }
+
+    renderMain();
+
+    // Scroll to the milestone in the milestone section
+    setTimeout(() => {
+      const milestoneSection = document.querySelector('.milestone-section');
+      if (!milestoneSection) {
+        console.warn('Milestone section not found');
+        return;
+      }
+
+      const milestoneEl = milestoneSection.querySelector(`[data-slug="${slug}"]`);
+      if (!milestoneEl) {
+        console.warn(`Milestone element with slug "${slug}" not found`);
+        return;
+      }
+
+      milestoneEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+      // Add a brief highlight effect
+      milestoneEl.style.transition = 'background 0.5s';
+      milestoneEl.style.background = 'rgba(34, 197, 94, 0.2)';
+      setTimeout(() => {
+        milestoneEl.style.background = '';
+      }, 1500);
+    }, 200);
+    return;
+  }
+
   const action = event.target.dataset.action;
   if (!action) return;
   if (action === 'open-create') {
@@ -876,11 +1083,40 @@ mainEl.addEventListener('change', (event) => {
   }
 });
 
+// Start polling for recent changes
+const startRecentChangesPolling = () => {
+  // Clear any existing polling
+  if (state.pollingInterval) {
+    clearInterval(state.pollingInterval);
+  }
+
+  // Poll every 10 seconds
+  state.pollingInterval = setInterval(async () => {
+    if (state.currentProject) {
+      await loadRecentChanges(false); // false = not silent, will play sound for new changes
+    }
+  }, 10000);
+};
+
+// Stop polling (useful when changing projects)
+const stopRecentChangesPolling = () => {
+  if (state.pollingInterval) {
+    clearInterval(state.pollingInterval);
+    state.pollingInterval = null;
+  }
+};
+
 (async () => {
   await loadProjects();
   if (state.currentProject) {
     await loadMilestones();
+    await loadRecentChanges(true); // true = silent on first load
   }
   renderSidebar();
   renderMain();
+
+  // Start polling for updates
+  if (state.currentProject) {
+    startRecentChangesPolling();
+  }
 })();

@@ -7,9 +7,9 @@ Never edit files under `.milstone/` or `milstone_status.md` directly—always us
 
 Setup & Project Management
 --------------------------
-1. `milstone project init "Project Name" PATH` – create `.milstone/` and seed the default project (override `--project-key` if needed).
-2. `milstone project report [--project-key KEY] [--output PATH]` – write "{status_md}" describing the active progress term.
-3. `milstone project ui [--project-key KEY]` – launch the background Flask UI / web dashboard.
+1. `milstone project init "Project Name" PATH` – create `.milstone/` and initialize the project.
+2. `milstone project report [--output PATH]` – write "{status_md}" describing the active progress term.
+3. `milstone project ui` – launch the background Flask UI / web dashboard.
 
 Milestone Lifecycle
 -------------------
@@ -27,7 +27,9 @@ Reporting & Tracking
 --------------------
 * `milstone project report` produces the Markdown snapshot consumed by dashboards.
 * `milstone progress show | reset | history` – inspect period totals, reset them, or review prior snapshots.
-* `milstone service start|stop|restart --port PORT` – manage the background web service without opening the UI.
+* `milstone service start|stop|restart|status|logs` – manage the background web service on port 8123 (only one instance allowed).
+  - Server logs are stored in `~/.milstone-server/server.log`
+  - Use `milstone service logs` to view the log file location.
 
 Remember: the CLI is self-documenting via `--help`. Encourage models to inspect command-specific help before invoking unfamiliar options.
 

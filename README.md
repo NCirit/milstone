@@ -1,35 +1,197 @@
 # Milstone
 
-Milstone is a CLI-first milestone tracking tool that keeps all operational state inside a project-local `.milstone/` directory (SQLite database, LLM usage guide, generated assets) while still emitting a Markdown snapshot of active milestones for easy sharing.
+Milstone is a CLI-first milestone tracking tool with a built-in web dashboard. It keeps all state inside a project-local `.milstone/` directory (SQLite database, LLM usage guide) while providing both command-line and web interfaces for managing milestones, tracking progress, and viewing project history.
 
-## Getting Started
+## Features
+
+- **Hierarchical Milestones**: Create nested milestone structures with parent-child relationships
+- **Progress Tracking**: Track hours and completion rates with periodic snapshots
+- **Live Web Dashboard**: Real-time updates with notifications for changes
+- **LLM-Friendly**: Includes auto-generated instructions for language models
+- **Multi-Project Support**: Recent projects sidebar with automatic tracking
+- **Soft Deletes**: Retain historical data while hiding completed or obsolete milestones
+
+## Installation
+
+### Install from Git (SSH)
 
 ```bash
-pip install -e .
-milstone project init "My Project" .
+pip install git+ssh://git@github.com/ncirit/milstone.git
 ```
 
-`milstone project init` seeds the default project row (`--project-key` defaults to `default`). All generated artifacts live under `.milstone/`. The bundled Flask app serves both the HTML dashboard and the JSON APIs the UI depends on—no external Node tooling required.
+### Install from Git (HTTPS)
 
-## CLI Commands
+```bash
+pip install git+https://github.com/ncirit/milstone.git
+```
 
-- `milstone milestone add "Feature A"` – create a milestone by title; the tool auto-generates a stable slug and accepts options such as `--status`, `--priority`, `--owner`, `--project-key` (defaults to `default`), `--parent`, and `--expected-hours` (default `1`).
-- `milstone milestone update <slug>` – patch existing milestones. You can re-parent (`--parent`, `--clear-parent`), tweak expected hours, and soft delete / restore (`--deleted/--undeleted`) without dropping historical data.
-- `milstone milestone list` – render a Rich-powered tree view for the selected project. Combine filters like `--status`, `--exclude-done`, or `--include-deleted`; by default it focuses on milestones active since the last progress reset.
-- `milstone project report` – render `milstone_status.md` in the current working directory unless `--output` is provided. This is the only artifact written outside `.milstone/`.
-- `milstone progress show` – display the current period’s progress (`completed_hours / total_hours`, milestone counts) since the most recent reset.
-- `milstone progress reset` – capture the current stats as a snapshot (optionally naming it) and start a fresh tracking period.
-- `milstone progress history` – list saved snapshots so you can review earlier periods at a glance.
-- `milstone service stop` – shut down the background web service without opening the UI (gracefully via `/__stop`, SIGTERM fallback).
-- `milstone project ui` – spins up (or reuses) the Flask web server, then opens the embedded dashboard (no Node/Next.js runtime needed). Make sure `pip install -e .` (or `pip install flask`) has been run so the CLI’s interpreter has Flask available.
-- `milstone service start|stop|restart` – manage the long-running web service without opening the UI (gracefully via `/__stop`, SIGTERM fallback).
+### Install for Development
 
-All commands accept `--path` to point at another project root that already contains a `.milstone/` directory. The `milstone project ui` command launches the Flask UI automatically, so simply run it and your browser will open to the dashboard.
+```bash
+git clone git@github.com:ncirit/milstone.git
+cd milstone
+pip install -e .
+```
 
-## Hierarchical Milestones & Soft Deletes
+## Quick Start
 
-- Every milestone can reference a parent milestone, allowing you to break large goals into nested sub-milestones. Both the CLI (`milstone milestone list`) and the web UI visualize this structure as a tree.
-- Milestones carry an `expected_hours` estimate (default `1`). Progress is calculated as `completed_hours / total_hours` for the active tracking period (since the last reset), so longer efforts count proportionally.
-- Milestones now have a `deleted` flag instead of being removed from the database. Use `milstone milestone update <slug> --deleted` (or the web “Soft Delete” form) to hide a milestone while retaining full history.
-- Resetting progress stores a snapshot (`milstone progress reset`) that preserves aggregate hours/counts for historical reference before starting the next period.
-- The browser UI mirrors popular React/Next.js dashboards: it shows recent projects, lets you toggle deleted milestones, edit/create/delete milestones inline, reset progress, review snapshot history, and keeps the tree + progress card in sync with CLI actions via the shared SQLite state.
+### 1. Initialize a Project
+
+```bash
+cd /path/to/your/project
+milstone project init "My Project"
+```
+
+This creates a `.milstone/` directory containing:
+- `milstone.db` - SQLite database with all milestone data
+- `llm_instructions.txt` - Auto-generated guide for LLM usage (customizable)
+
+### 2. Create Milestones
+
+```bash
+# Create a top-level milestone
+milstone milestone add "Setup Backend Infrastructure" --expected-hours 8
+
+# Create a child milestone
+milstone milestone add "Setup Database" --parent setup-backend-infrastructure --expected-hours 3
+
+# Add a log entry
+milstone log add setup-database "Created schema and migrations"
+```
+
+### 3. Launch the Web UI
+
+```bash
+milstone project ui
+```
+
+This starts the web server on port 8123 and opens your browser. The dashboard provides:
+- Interactive milestone tree with expand/collapse
+- Real-time recent changes feed with notifications
+- Progress tracking and history
+- Create, edit, and delete milestones
+- Add log entries and track status changes
+
+### 4. Generate Status Report
+
+```bash
+milstone project report
+```
+
+Creates `milstone_status.md` with the current milestone status.
+
+## Example Workflow
+
+```bash
+# Start a new project
+milstone project init "E-commerce Platform"
+
+# Add main features
+milstone milestone add "User Authentication" --expected-hours 16
+milstone milestone add "Product Catalog" --expected-hours 24
+milstone milestone add "Shopping Cart" --expected-hours 20
+
+# Break down into tasks
+milstone milestone add "Login System" --parent user-authentication --expected-hours 8
+milstone milestone add "OAuth Integration" --parent user-authentication --expected-hours 8
+
+# Track progress
+milstone log add login-system "Implemented JWT authentication"
+milstone milestone update login-system --status done
+
+# View progress
+milstone progress show
+
+# Open web dashboard for visual management
+milstone project ui
+
+# Save a snapshot at milestone completion
+milstone progress reset --label "Phase 1 Complete"
+```
+
+## Service Management
+
+```bash
+# Start the web service in background
+milstone service start
+
+# Check service status
+milstone service status
+
+# View server logs
+milstone service logs
+
+# Stop the service
+milstone service stop
+```
+
+## LLM Instructions
+
+Milstone includes auto-generated instructions for LLM models in `.milstone/llm_instructions.txt`. This file helps language models understand how to:
+- Use the CLI commands correctly
+- Manage milestones and track progress
+- Follow project-specific conventions
+
+### Customizing LLM Instructions
+
+After running `milstone project init`, you can customize the "User Instructions" section in `.milstone/llm_instructions.txt` to add project-specific guidelines:
+
+```txt
+User Instructions
+-----------------
+* Write detailed descriptions for each milestone explaining what needs to be done.
+* Only mark milestones as completed when all work is finished.
+* Split large milestones into smaller ones that can be completed quickly.
+* Use `milstone log add` to record progress updates regularly.
+* Review milestone status frequently to keep tracking accurate.
+```
+
+### Providing Instructions to LLMs
+
+When working with language models (like Claude, GPT-4, etc.), you can:
+
+1. **Include the file in context**: Share the contents of `.milstone/llm_instructions.txt` with the LLM
+2. **Reference in prompts**: "Please follow the guidelines in .milstone/llm_instructions.txt"
+3. **Project initialization**: The LLM can run `milstone project init` and read the generated instructions
+
+Example prompt:
+```
+I'm working on a project tracked with Milstone. Please read .milstone/llm_instructions.txt
+and help me create milestones for implementing a REST API with authentication, database
+integration, and documentation.
+```
+
+The LLM will then use the commands appropriately and follow your project's conventions.
+
+## CLI Help
+
+All commands support `--help` for detailed usage:
+
+```bash
+milstone --help
+milstone milestone --help
+milstone milestone add --help
+```
+
+## Project Structure
+
+```
+your-project/
+├── .milstone/
+│   ├── milstone.db           # SQLite database
+│   └── llm_instructions.txt  # LLM usage guide (customizable)
+├── milstone_status.md        # Generated status report
+└── ... your project files ...
+```
+
+## Architecture
+
+- **CLI**: Python with Typer for command-line interface
+- **Database**: SQLite for local storage (inside `.milstone/`)
+- **Web Server**: Flask serving both HTML dashboard and JSON APIs
+- **Frontend**: Vanilla JavaScript with real-time polling for updates
+- **Global State**: Server info and project history in `~/.milstone-server/`
+
+## License
+
+MIT

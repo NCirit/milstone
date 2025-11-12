@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import multiprocessing
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -24,7 +25,6 @@ from . import state
 
 app = typer.Typer(help="Manage milestones via CLI and web interface")
 project_app = typer.Typer(help="Project-level commands")
-legacy_update_app = typer.Typer(help="DEPRECATED: use `milstone project report` instead")
 milestone_app = typer.Typer(help="Create, update, and list milestones")
 log_app = typer.Typer(help="Manage milestone logs")
 progress_app = typer.Typer(help="Progress tracking commands")
@@ -36,8 +36,8 @@ STATUS_MD_FILENAME = "milstone_status.md"
 LLM_USAGE_FILENAME = "llm_instructions.txt"
 LLM_TEMPLATE_PATH = Path(__file__).resolve().parent / "data" / "llm_instructions_template.txt"
 SERVER_MODULE_PATH = "milstone.server"
-DEFAULT_PROJECT_KEY = "default"
 DEFAULT_EXPECTED_HOURS = 1.0
+MILSTONE_SERVER_PORT = 8123  # Hardcoded port for Milstone server
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
 
 SCHEMA_SQL = """
@@ -134,6 +134,23 @@ def _maybe_add_column(conn: sqlite3.Connection, table: str, column: str, column_
         conn.commit()
 
 
+def _migrate_old_project_keys(conn: sqlite3.Connection) -> None:
+    """Migrate old hardcoded project keys (e.g., 'main', 'default') to UUIDs."""
+    # Check if there are any projects with non-UUID keys
+    # A simple heuristic: if the key doesn't contain a hyphen, it's probably old
+    rows = conn.execute("SELECT id, key FROM projects WHERE key NOT LIKE '%-%'").fetchall()
+
+    if not rows:
+        return  # No old keys to migrate
+
+    with conn:
+        for row in rows:
+            old_key = row["key"]
+            new_key = str(uuid.uuid4())
+            conn.execute("UPDATE projects SET key = ? WHERE id = ?", (new_key, row["id"]))
+            typer.echo(f"Migrated project key from '{old_key}' to '{new_key}'")
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     _maybe_add_column(conn, "milestones", "parent_id", "parent_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL")
@@ -142,6 +159,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _maybe_add_column(conn, "milestone_updates", "sequence", "sequence INTEGER")
     _ensure_log_sequences(conn)
     _normalize_statuses(conn)
+    _migrate_old_project_keys(conn)
 
 
 def _state_dir(base_path: Path) -> Path:
@@ -202,7 +220,7 @@ def _dump_llm_usage(target_dir: Path) -> None:
     except FileNotFoundError:
         template = LLM_FALLBACK_TEXT
     llm_file.write_text(
-        template.format(status_md=STATUS_MD_FILENAME, default_project=DEFAULT_PROJECT_KEY),
+        template.format(status_md=STATUS_MD_FILENAME),
         encoding="utf-8",
     )
 
@@ -283,7 +301,15 @@ def _ensure_project(conn: sqlite3.Connection, key: str, name: Optional[str] = No
 def _get_project_id(conn: sqlite3.Connection, key: str) -> int:
     row = conn.execute("SELECT id FROM projects WHERE key = ?", (key,)).fetchone()
     if not row:
-        raise typer.BadParameter(f"Project '{key}' not found. Create it via `milstone milestone add --project-key {key}` or run `milstone project init`.")
+        raise typer.BadParameter(f"Project '{key}' not found. Run `milstone project init` first.")
+    return row[0]
+
+
+def _get_single_project_id(conn: sqlite3.Connection) -> int:
+    """Get the ID of the single project in this .milstone folder."""
+    row = conn.execute("SELECT id FROM projects LIMIT 1").fetchone()
+    if not row:
+        raise typer.BadParameter("No project found. Run `milstone project init` first.")
     return row[0]
 
 
@@ -502,14 +528,11 @@ def _record_snapshot(conn: sqlite3.Connection, project_id: int, label: Optional[
     return conn.execute("SELECT * FROM progress_snapshots WHERE id = ?", (cursor.lastrowid,)).fetchone()
 
 
-def _pid_is_running(pid: Optional[int]) -> bool:
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+
+
+def _server_log_path() -> Path:
+    """Get the path to the server log file."""
+    return state.global_runtime_dir() / "server.log"
 
 
 def _ping_server(port: int, timeout: float = 0.5) -> bool:
@@ -522,8 +545,7 @@ def _ping_server(port: int, timeout: float = 0.5) -> bool:
 
 def _start_server_process(port: int) -> subprocess.Popen:
     _ensure_flask_available()
-    runtime_dir = state.global_runtime_dir()
-    server_log = runtime_dir / "server.log"
+    server_log = _server_log_path()
     server_log.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
@@ -532,42 +554,50 @@ def _start_server_process(port: int) -> subprocess.Popen:
         "--port",
         str(port),
     ]
-    log_handle = open(server_log, "a", encoding="utf-8")
-    try:
-        return subprocess.Popen(
-            cmd,
-            stdout=log_handle,
-            stderr=log_handle,
-            stdin=subprocess.DEVNULL,
-            close_fds=os.name != "nt",
-            start_new_session=os.name != "nt",
-        )
-    finally:
-        log_handle.close()
+    # Open log file for the subprocess - don't close it, let the subprocess own it
+    # The file will be closed when the subprocess terminates
+    log_handle = open(server_log, "a", encoding="utf-8", buffering=1)  # Line buffered
+    return subprocess.Popen(
+        cmd,
+        stdout=log_handle,
+        stderr=log_handle,
+        stdin=subprocess.DEVNULL,
+        close_fds=os.name != "nt",
+        start_new_session=os.name != "nt",
+    )
 
 
-def _ensure_web_server(requested_port: int) -> Dict[str, int]:
-    info = state.read_global_server_info()
-    if info and _pid_is_running(info.get("pid")) and _ping_server(info.get("port", requested_port)):
-        running_port = info.get("port", requested_port)
-        if running_port != requested_port:
-            typer.echo(f"Reusing web server already running on port {running_port}.")
-        return {"pid": info.get("pid"), "port": running_port}
+def _get_or_start_server() -> int:
+    """
+    Get existing server or start a new one on the hardcoded port.
+    Uses simple health check to detect running server.
 
-    state.clear_global_server_info()
-    process = _start_server_process(requested_port)
+    Returns:
+        Port number (always MILSTONE_SERVER_PORT)
+
+    Raises:
+        typer.BadParameter: If server fails to start
+    """
+    # Check if server is already running via health check
+    if _ping_server(MILSTONE_SERVER_PORT):
+        return MILSTONE_SERVER_PORT
+
+    # No running server found, start a new one
+    process = _start_server_process(MILSTONE_SERVER_PORT)
     start = time.time()
     while time.time() - start < 5:
         if process.poll() is not None:
+            # Process terminated, check if it was an error
             break
-        if _ping_server(requested_port):
-            info = {"pid": process.pid, "port": requested_port}
-            state.write_global_server_info(info)
-            return info
+        if _ping_server(MILSTONE_SERVER_PORT):
+            # Server is up and responding
+            return MILSTONE_SERVER_PORT
         time.sleep(0.2)
 
+    # Server failed to start
     process.terminate()
-    raise typer.BadParameter("Failed to start Milstone web server (check .milstone/server.log for details).")
+    log_path = _server_log_path()
+    raise typer.BadParameter(f"Failed to start Milstone web server. Check log file for details:\n{log_path}")
 
 
 def _record_project_history(state_dir: Path, entry: Dict[str, str]) -> None:
@@ -581,67 +611,37 @@ def _fetch_project_info(conn: sqlite3.Connection, project_id: int) -> Dict[str, 
     return {"key": row["key"], "name": row["name"], "description": row["description"]}
 
 
-def _stop_web_server() -> None:
-    info = state.read_global_server_info()
-    if not info:
-        return
-    pid = info.get("pid")
-    if not _pid_is_running(pid):
-        state.clear_global_server_info()
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        state.clear_global_server_info()
-        return
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        if not _pid_is_running(pid):
-            break
-        time.sleep(0.2)
-    state.clear_global_server_info()
 
 
-def _request_server_shutdown(port: int) -> bool:
+def _shutdown_service() -> bool:
+    """
+    Shutdown the Milstone server on the hardcoded port.
+
+    Returns:
+        True if graceful shutdown succeeded, False otherwise
+    """
+    # Check if server is running
+    if not _ping_server(MILSTONE_SERVER_PORT):
+        return False
+
+    # Request graceful shutdown
     request_obj = urllib_request.Request(
-        f"http://127.0.0.1:{port}/__stop",
+        f"http://127.0.0.1:{MILSTONE_SERVER_PORT}/__stop",
         data=b"{}",
         headers={"Content-Type": "application/json"},
     )
     try:
         with urllib_request.urlopen(request_obj, timeout=1) as resp:
-            return resp.status == 200
-    except Exception as exc:
-        typer.secho(
-            f"Failed to request shutdown from service on port {port}: {exc}",
-            fg="red",
-        )
-        return False
+            if resp.status == 200:
+                # Wait for server to stop (up to 5 seconds)
+                for _ in range(25):
+                    if not _ping_server(MILSTONE_SERVER_PORT):
+                        return True
+                    time.sleep(0.2)
+    except Exception:
+        pass
 
-
-def _shutdown_service(port: Optional[int] = None) -> bool:
-    info = state.read_global_server_info()
-    if not info:
-        return False
-
-    running_port = info.get("port")
-    running_pid = info.get("pid")
-    target_port = int(port) if port is not None else running_port
-
-    graceful = False
-    if target_port:
-        if _request_server_shutdown(int(target_port)):
-            for _ in range(25):
-                if not _pid_is_running(running_pid):
-                    break
-                time.sleep(0.2)
-            else:
-                # still running; will fall back to hard kill
-                pass
-            graceful = True
-
-    _stop_web_server()
-    return graceful
+    return False
 
 
 def _register_project_with_server(
@@ -667,16 +667,23 @@ def _register_project_with_server(
         with urllib_request.urlopen(request_obj, timeout=5):
             return
     except urllib_error.HTTPError as exc:
-        raise typer.BadParameter(f"Failed to register project with server: {exc.read().decode()}") from exc
+        log_path = _server_log_path()
+        raise typer.BadParameter(
+            f"Failed to register project with server: {exc.read().decode()}\n"
+            f"Check server log for details: {log_path}"
+        ) from exc
     except urllib_error.URLError as exc:
-        raise typer.BadParameter("Unable to contact Milstone server for registration.") from exc
+        log_path = _server_log_path()
+        raise typer.BadParameter(
+            f"Unable to contact Milstone server for registration.\n"
+            f"Check server log for details: {log_path}"
+        ) from exc
 
 
 @project_app.command("init")
 def project_init(
-    project_name: str = typer.Argument(..., help="Human-friendly name for the default project"),
+    project_name: str = typer.Argument(..., help="Project name"),
     path: Path = typer.Argument(Path("."), help="Project root to initialize"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", help="Key for the default project"),
     description: Optional[str] = typer.Option(None, "--description", help="Optional description for the project"),
 ) -> None:
     """Initialize milestone tracking artifacts."""
@@ -685,6 +692,9 @@ def project_init(
     typer.echo(f"Initializing Milstone in {project_root}")
     state_dir = _state_dir(project_root)
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate a unique UUID for this project
+    project_key = str(uuid.uuid4())
 
     conn = sqlite3.connect(_db_path(project_root))
     conn.execute("PRAGMA foreign_keys = ON")
@@ -695,14 +705,13 @@ def project_init(
         conn.close()
 
     _dump_llm_usage(state_dir)
-    typer.echo(f"Initialization complete: .milstone assets ready for '{project_name}' ({project_key}).")
+    typer.echo(f"Initialization complete: .milstone assets ready for '{project_name}'.")
     typer.echo(f"Note: You can customize the 'User Instructions' section in .milstone/{LLM_USAGE_FILENAME} to add your own guidelines for LLM models.")
 
 
 @project_app.command("report")
 def project_report(
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key to report"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Path for rendered markdown (defaults to CWD/milstone_status.md)"),
 ) -> None:
     """Generate markdown summary of the current progress term."""
@@ -710,7 +719,7 @@ def project_report(
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         project_info = _fetch_project_info(conn, project_id)
         since = _current_period_start(conn, project_id)
         progress = _progress_stats(conn, project_id, since)
@@ -726,45 +735,31 @@ def project_report(
     typer.echo(f"Wrote {output_path}")
 
 
-@legacy_update_app.command("status")
-def legacy_update_status(
-    path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Path for rendered markdown (defaults to CWD/milstone_status.md)"),
-) -> None:
-    typer.secho("`milstone update status` is deprecated. Use `milstone project report` instead.", fg="yellow")
-    project_report(path=path, project_key=DEFAULT_PROJECT_KEY, output=output)
-
-
-@app.command("init", hidden=True)
-def legacy_init(
-    project_name: str = typer.Argument(..., help="Human-friendly name for the default project"),
-    path: Path = typer.Argument(Path("."), help="Project root to initialize"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", help="Key for the default project"),
-    description: Optional[str] = typer.Option(None, "--description", help="Optional description for the project"),
-) -> None:
-    """Backward compatible entry point for `milstone init`."""
-
-    typer.secho("`milstone init` is deprecated. Use `milstone project init` instead.", fg="yellow")
-    project_init(project_name, path, project_key, description)
-
-
 def _resolve_project_fields(
     conn: sqlite3.Connection,
-    project_key: str,
     project_name: Optional[str],
     project_description: Optional[str],
     create_if_missing: bool,
 ) -> int:
+    """Get the project ID for the single project in this .milstone folder.
+
+    If create_if_missing is True and no project exists, creates one with a UUID key.
+    """
     if create_if_missing:
+        # Check if project already exists
+        row = conn.execute("SELECT id FROM projects LIMIT 1").fetchone()
+        if row:
+            return row[0]
+        # Create new project with UUID key
+        project_key = str(uuid.uuid4())
         return _ensure_project(conn, project_key, project_name, project_description)
-    return _get_project_id(conn, project_key)
+    return _get_single_project_id(conn)
 
 
 @milestone_app.command("add")
 def create_milestone(
     title: str = typer.Argument(..., help="Human readable title"),
     path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key to attach the milestone to"),
     project_name: Optional[str] = typer.Option(None, "--project-name", help="Project name (used if project needs to be created)"),
     project_description: Optional[str] = typer.Option(None, "--project-description", help="Project description if a new project is created"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Additional context or markdown"),
@@ -785,13 +780,13 @@ def create_milestone(
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, project_name, project_description, create_if_missing=True)
+        project_id = _resolve_project_fields(conn, project_name, project_description, create_if_missing=True)
         parent_id: Optional[int] = None
         slug = _generate_slug(conn, project_id, title)
         if parent:
             parent_row = _lookup_milestone(conn, project_id, parent)
             if parent_row is None:
-                raise typer.BadParameter(f"Parent milestone '{parent}' not found or deleted in project '{project_key}'.")
+                raise typer.BadParameter(f"Parent milestone '{parent}' not found or deleted.")
             parent_id = parent_row["id"]
         if parent == slug:
             raise typer.BadParameter("A milestone cannot be its own parent.")
@@ -820,18 +815,17 @@ def create_milestone(
                 ),
             )
     except sqlite3.IntegrityError as exc:
-        raise typer.BadParameter(f"Milestone '{slug}' already exists for project '{project_key}'.") from exc
+        raise typer.BadParameter(f"Milestone '{slug}' already exists.") from exc
     finally:
         conn.close()
 
-    typer.echo(f"Created milestone '{slug}' in project '{project_key}'.")
+    typer.echo(f"Created milestone '{slug}'.")
 
 
 @milestone_app.command("update")
 def update_milestone(
     slug: str = typer.Argument(..., help="Slug of the milestone to update"),
     path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key the milestone belongs to"),
     title: Optional[str] = typer.Option(None, "--title", "-t", help="New title"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="New description"),
     status: Optional[str] = typer.Option(None, "--status", "-s", help="New status"),
@@ -857,10 +851,10 @@ def update_milestone(
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         existing = _lookup_milestone(conn, project_id, slug, include_deleted=True)
         if existing is None:
-            raise typer.BadParameter(f"Milestone '{slug}' not found in project '{project_key}'.")
+            raise typer.BadParameter(f"Milestone '{slug}' not found.")
         updates: Dict[str, object] = {}
         for field_name, value in (
             ("title", title),
@@ -878,7 +872,7 @@ def update_milestone(
         if parent:
             parent_row = _lookup_milestone(conn, project_id, parent)
             if parent_row is None:
-                raise typer.BadParameter(f"Parent milestone '{parent}' not found or deleted in project '{project_key}'.")
+                raise typer.BadParameter(f"Parent milestone '{parent}' not found or deleted.")
             updates["parent_id"] = parent_row["id"]
         elif clear_parent:
             updates["parent_id"] = None
@@ -916,7 +910,6 @@ def update_milestone(
 @milestone_app.command("list")
 def list_milestones(
     path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key to list milestones for"),
     status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by status"),
     include_done: bool = typer.Option(True, "--include-done/--exclude-done", help="Whether to include completed milestones"),
     include_deleted: bool = typer.Option(False, "--include-deleted", help="Include soft-deleted milestones in the output"),
@@ -926,7 +919,8 @@ def list_milestones(
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        project_info = _fetch_project_info(conn, project_id)
         since = _current_period_start(conn, project_id)
         query = [
             "SELECT id, parent_id, slug, title, status, priority, owner, start_date, due_date, completed_at, deleted, expected_hours, created_at",
@@ -962,7 +956,7 @@ def list_milestones(
         else:
             roots.append(row)
 
-    tree = Tree(f"[bold]Milestones ({project_key})[/bold]")
+    tree = Tree(f"[bold]Milestones ({project_info['name']})[/bold]")
 
     def _label(row: sqlite3.Row) -> str:
         display_status = "deleted" if row["deleted"] else row["status"]
@@ -998,14 +992,13 @@ def logs_add(
     slug: str = typer.Argument(..., help="Milestone slug"),
     summary: str = typer.Argument(..., help="Log summary"),
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key"),
 ) -> None:
     """Add a log entry to a milestone."""
 
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         milestone = _lookup_milestone(conn, project_id, slug, include_deleted=True)
         if milestone is None:
             raise typer.BadParameter(f"Milestone '{slug}' not found.")
@@ -1020,14 +1013,13 @@ def logs_add(
 def logs_list(
     slug: str = typer.Argument(..., help="Milestone slug"),
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key"),
 ) -> None:
     """List logs for a milestone."""
 
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         milestone = _lookup_milestone(conn, project_id, slug, include_deleted=True)
         if milestone is None:
             raise typer.BadParameter(f"Milestone '{slug}' not found.")
@@ -1060,7 +1052,6 @@ def logs_list(
 def logs_edit(
     slug: str = typer.Argument(..., help="Milestone slug"),
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key"),
     summary: Optional[str] = typer.Option(None, "--summary", help="Updated summary"),
     index: Optional[int] = typer.Option(None, "--index", "-i", help="Log sequence number"),
     log_id: Optional[int] = typer.Option(None, "--log-id", help="Explicit log row id"),
@@ -1073,7 +1064,7 @@ def logs_edit(
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         milestone = _lookup_milestone(conn, project_id, slug, include_deleted=True)
         if milestone is None:
             raise typer.BadParameter(f"Milestone '{slug}' not found.")
@@ -1099,14 +1090,13 @@ def _format_stats(stats: Dict[str, float]) -> str:
 @progress_app.command("show")
 def progress_show(
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key"),
 ) -> None:
     """Display progress for the current period (since the last reset)."""
 
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         since = _current_period_start(conn, project_id)
         stats = _progress_stats(conn, project_id, since)
     finally:
@@ -1119,7 +1109,6 @@ def progress_show(
 @progress_app.command("reset")
 def progress_reset(
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key"),
     label: Optional[str] = typer.Option(None, "--label", "-l", help="Label for the saved snapshot"),
 ) -> None:
     """Save the current progress stats and start a new period."""
@@ -1127,7 +1116,7 @@ def progress_reset(
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         snapshot = _record_snapshot(conn, project_id, label)
     finally:
         conn.close()
@@ -1141,14 +1130,14 @@ def progress_reset(
 @progress_app.command("history")
 def progress_history(
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key"),
 ) -> None:
     """List saved progress snapshots."""
 
     project_root = path.resolve()
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        project_info = _fetch_project_info(conn, project_id)
         rows = conn.execute(
             "SELECT label, created_at, total_hours, completed_hours, total_count, completed_count "
             "FROM progress_snapshots WHERE project_id = ? ORDER BY created_at DESC",
@@ -1161,7 +1150,7 @@ def progress_history(
         typer.echo("No snapshots found.")
         return
 
-    table = Table(title=f"Progress snapshots ({project_key})")
+    table = Table(title=f"Progress snapshots ({project_info['name']})")
     table.add_column("Created", style="cyan")
     table.add_column("Label")
     table.add_column("Hours")
@@ -1175,53 +1164,81 @@ def progress_history(
 
 app.add_typer(progress_app, name="progress")
 app.add_typer(service_app, name="service")
-app.add_typer(legacy_update_app, name="update")
 
 
 @service_app.command("start")
-def service_start(
-    port: int = typer.Option(8123, "--port", "-p", help="Port for the Milstone background service"),
-) -> None:
-    """Start the background Milstone web service (or reuse an existing one)."""
+def service_start() -> None:
+    """Start the background Milstone web service on port 8123."""
 
-    info = _ensure_web_server(port)
-    typer.echo(f"Milstone web service running on port {info['port']} (pid {info['pid']}).")
+    # Check if already running
+    if _ping_server(MILSTONE_SERVER_PORT):
+        typer.echo(f"Milstone web service is already running on port {MILSTONE_SERVER_PORT}.")
+        return
+
+    # Start the server
+    try:
+        _get_or_start_server()
+        typer.echo(f"Milstone web service started on port {MILSTONE_SERVER_PORT}.")
+        log_path = _server_log_path()
+        typer.echo(f"Server logs: {log_path}")
+    except typer.BadParameter:
+        raise
 
 
 @service_app.command("stop")
-def service_stop(
-    port: Optional[int] = typer.Option(None, "--port", "-p", help="Port to stop (defaults to remembered port)"),
-) -> None:
-    """Stop the background Milstone web service, if running."""
+def service_stop() -> None:
+    """Stop the background Milstone web service."""
 
-    info = state.read_global_server_info()
-    remembered_port = info.get("port") if info else None
-    target_port = port or remembered_port
-    if target_port is None:
-        typer.echo("No known running service; nothing to stop.")
-        raise typer.Exit(code=0)
+    if not _ping_server(MILSTONE_SERVER_PORT):
+        typer.echo("Milstone web service is not running.")
+        return
 
-    typer.echo(f"Stopping Milstone web service on port {target_port}...")
-    graceful = _shutdown_service(target_port)
-    typer.echo("Background service stopped cleanly." if graceful else "Background service force-stopped.")
+    typer.echo(f"Stopping Milstone web service on port {MILSTONE_SERVER_PORT}...")
+    graceful = _shutdown_service()
+    typer.echo("Service stopped cleanly." if graceful else "Service stopped.")
 
 
 @service_app.command("restart")
-def service_restart(
-    port: int = typer.Option(8123, "--port", "-p", help="Port for the Milstone background service"),
-) -> None:
+def service_restart() -> None:
     """Restart the background Milstone web service."""
 
     typer.echo("Restarting Milstone web service...")
-    _shutdown_service(port)
-    info = _ensure_web_server(port)
-    typer.echo(f"Milstone web service restarted on port {info['port']} (pid {info['pid']}).")
+    _shutdown_service()
+    _get_or_start_server()
+    typer.echo(f"Milstone web service restarted on port {MILSTONE_SERVER_PORT}.")
+
+
+@service_app.command("status")
+def service_status() -> None:
+    """Check the status of the Milstone web service."""
+
+    if _ping_server(MILSTONE_SERVER_PORT):
+        typer.echo(f"Milstone web service is running on port {MILSTONE_SERVER_PORT}.")
+        typer.echo(f"Access the dashboard at: http://127.0.0.1:{MILSTONE_SERVER_PORT}")
+    else:
+        typer.echo("Milstone web service is not running.")
+
+    log_path = _server_log_path()
+    typer.echo(f"Server logs: {log_path}")
+
+
+@service_app.command("logs")
+def service_logs() -> None:
+    """Show the location of the server log file."""
+
+    log_path = _server_log_path()
+    typer.echo(f"Server log file: {log_path}")
+
+    if log_path.exists():
+        size_kb = log_path.stat().st_size / 1024
+        typer.echo(f"Log file size: {size_kb:.2f} KB")
+    else:
+        typer.echo("Log file does not exist yet (server has not been started).")
+
 
 @project_app.command("ui")
 def project_ui(
     path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key to open"),
-    port: int = typer.Option(8123, help="Preferred port for the Milstone background service"),
 ) -> None:
     """Start (or reuse) the Milstone web server and open the UI for the requested project."""
 
@@ -1232,7 +1249,7 @@ def project_ui(
 
     conn = _connect_existing(project_root)
     try:
-        project_id = _resolve_project_fields(conn, project_key, None, None, create_if_missing=False)
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
         project_info = _fetch_project_info(conn, project_id)
     finally:
         conn.close()
@@ -1245,27 +1262,14 @@ def project_ui(
     }
     _record_project_history(state_dir, project_entry)
 
-    server_info = _ensure_web_server(port)
-    _register_project_with_server(server_info["port"], project_info, project_root, state_dir)
-    url = f"http://127.0.0.1:{server_info['port']}/?project={project_info['key']}"
+    # Get or start server on hardcoded port
+    _get_or_start_server()
+
+    _register_project_with_server(MILSTONE_SERVER_PORT, project_info, project_root, state_dir)
+    url = f"http://127.0.0.1:{MILSTONE_SERVER_PORT}/?project={project_info['key']}"
     typer.echo(f"Opening Milstone web UI at {url}")
-    typer.launch(url)
-
-
-@app.command("manage", hidden=True)
-def legacy_manage(
-    path: Path = typer.Option(Path("."), "--path", help="Project root"),
-    project_key: str = typer.Option(DEFAULT_PROJECT_KEY, "--project-key", "-p", help="Project key to open"),
-    port: int = typer.Option(8123, help="Preferred port for the Milstone background service"),
-    restart_service: bool = typer.Option(False, "--restart-service", help="Restart the background service before opening the UI"),
-) -> None:
-    """Backward compatible alias for `milstone project ui`."""
-
-    typer.secho("`milstone manage` is deprecated. Use `milstone project ui` instead.", fg="yellow")
-    if restart_service:
-        typer.echo("Restarting Milstone web service...")
-        _shutdown_service(port)
-    project_ui(path=path, project_key=project_key, port=port)
+    # Launch browser without waiting for it to exit
+    typer.launch(url, wait=False)
 
 
 if __name__ == "__main__":

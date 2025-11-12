@@ -7,6 +7,7 @@ import os
 import signal
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,11 +22,8 @@ STATIC_FOLDER = BASE_DIR / "static"
 TEMPLATE_FOLDER = BASE_DIR / "templates"
 DB_FILENAME = "milstone.db"
 DEFAULT_EXPECTED_HOURS = 1.0
-REGISTRY_PATH = state.global_runtime_dir() / "web_registry.json"
-REGISTRY_LOCK = threading.RLock()
-
-PROJECT_REGISTRY: Dict[str, Dict[str, Any]] = {}
-CURRENT_PROJECT: Optional[str] = None
+# Project registry is now handled by state.load_history() / state.save_history()
+# No need for separate in-memory registry
 
 app = Flask(
     __name__,
@@ -35,82 +33,19 @@ app = Flask(
 
 
 # ---------------------------------------------------------------------------
-# Registry helpers
+# Project history helpers (uses state.py functions)
 # ---------------------------------------------------------------------------
 
-def _registry_snapshot() -> Dict[str, Any]:
-    with REGISTRY_LOCK:
-        projects = sorted(
-            PROJECT_REGISTRY.values(),
-            key=lambda item: item.get("lastOpened", ""),
-            reverse=True,
-        )
-        current = CURRENT_PROJECT if CURRENT_PROJECT in PROJECT_REGISTRY else None
-        if not current and projects:
-            current = projects[0]["key"]
-        return {"projects": projects, "current_project": current}
-
-
-def _persist_registry_locked() -> None:
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "current_project": CURRENT_PROJECT,
-        "projects": sorted(
-            PROJECT_REGISTRY.values(),
-            key=lambda item: item.get("lastOpened", ""),
-            reverse=True,
-        ),
-    }
-    REGISTRY_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _load_registry() -> None:
-    global CURRENT_PROJECT
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not REGISTRY_PATH.exists():
-        return
-    try:
-        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return
-    projects = data.get("projects", []) or []
-    with REGISTRY_LOCK:
-        PROJECT_REGISTRY.clear()
-        for entry in projects:
-            if "key" in entry and "stateDir" in entry:
-                PROJECT_REGISTRY[entry["key"]] = dict(entry)
-        CURRENT_PROJECT = data.get("current_project")
-
-
-def _touch_project(project_key: str) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    with REGISTRY_LOCK:
-        entry = PROJECT_REGISTRY.get(project_key)
-        if not entry:
-            return
-        entry["lastOpened"] = now
-        global CURRENT_PROJECT
-        CURRENT_PROJECT = project_key
-        _persist_registry_locked()
-
-
-def _set_project_entry(entry: Dict[str, Any]) -> None:
-    with REGISTRY_LOCK:
-        PROJECT_REGISTRY[entry["key"]] = entry
-        global CURRENT_PROJECT
-        CURRENT_PROJECT = entry["key"]
-        _persist_registry_locked()
-
-
 def _get_project_entry(project_key: str) -> Dict[str, Any]:
-    with REGISTRY_LOCK:
-        entry = PROJECT_REGISTRY.get(project_key)
-    if not entry:
-        raise KeyError(project_key)
-    return entry
+    """Get project entry by key from history."""
+    history = state.load_history()
+    projects = history.get("projects", [])
+    for project in projects:
+        if project.get("key") == project_key:
+            return project
+    raise KeyError(f"Project '{project_key}' not found in history")
 
 
-_load_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +95,23 @@ def _ensure_log_sequences(conn: sqlite3.Connection) -> None:
             milestone_id = row["milestone_id"]
             counters[milestone_id] = counters.get(milestone_id, 0) + 1
             conn.execute("UPDATE milestone_updates SET sequence = ? WHERE id = ?", (counters[milestone_id], row["id"]))
+
+
+def _migrate_old_project_keys(conn: sqlite3.Connection) -> None:
+    """Migrate old hardcoded project keys (e.g., 'main', 'default') to UUIDs."""
+    # Check if there are any projects with non-UUID keys
+    # A simple heuristic: if the key doesn't contain a hyphen, it's probably old
+    rows = conn.execute("SELECT id, key FROM projects WHERE key NOT LIKE '%-%'").fetchall()
+
+    if not rows:
+        return  # No old keys to migrate
+
+    with conn:
+        for row in rows:
+            old_key = row["key"]
+            new_key = str(uuid.uuid4())
+            conn.execute("UPDATE projects SET key = ? WHERE id = ?", (new_key, row["id"]))
+            print(f"Migrated project key from '{old_key}' to '{new_key}'")
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -224,6 +176,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _maybe_add_column(conn, "milestone_updates", "sequence", "sequence INTEGER")
     _ensure_log_sequences(conn)
     _normalize_statuses(conn)
+    _migrate_old_project_keys(conn)
 
 
 def _today_iso() -> str:
@@ -702,7 +655,9 @@ def home():
 
 @app.get("/api/projects")
 def api_projects():
-    return jsonify(_registry_snapshot())
+    """Get list of all projects from history."""
+    history = state.load_history()
+    return jsonify(history)
 
 
 @app.post("/api/projects/register")
@@ -736,9 +691,9 @@ def api_register_project():
         "description": payload.get("description") or project["description"],
         "path": payload.get("path") or state_dir.parent.as_posix(),
         "stateDir": str(state_dir),
-        "lastOpened": datetime.now(timezone.utc).isoformat(),
     }
-    _set_project_entry(entry)
+    # Record this project in history
+    state.record_project_open(entry)
     return jsonify({"status": "ok"})
 
 
@@ -784,7 +739,6 @@ def api_milestones():
     finally:
         conn.close()
 
-    _touch_project(project_key)
     return jsonify(response)
 
 
@@ -802,7 +756,7 @@ def api_create_milestone():
         return (str(exc), 400)
     try:
         slug = _create_milestone(conn, project["id"], payload)
-        _touch_project(project_key)
+
         return jsonify({"status": "ok", "slug": slug})
     except ValueError as exc:
         return (str(exc), 400)
@@ -824,7 +778,7 @@ def api_update_milestone():
         return (str(exc), 400)
     try:
         _update_milestone(conn, project["id"], payload)
-        _touch_project(project_key)
+
         return jsonify({"status": "ok"})
     except ValueError as exc:
         return (str(exc), 400)
@@ -846,7 +800,7 @@ def api_delete_milestone():
         return (str(exc), 400)
     try:
         _soft_delete_milestone(conn, project["id"], payload.get("slug", ""))
-        _touch_project(project_key)
+
         return jsonify({"status": "ok"})
     except ValueError as exc:
         return (str(exc), 400)
@@ -870,7 +824,7 @@ def api_create_log():
     try:
         milestone = _milestone_by_slug(conn, project["id"], slug)
         log = _insert_log(conn, milestone["id"], payload)
-        _touch_project(project_key)
+
         return jsonify({"status": "ok", "log": log})
     except ValueError as exc:
         return (str(exc), 400)
@@ -894,7 +848,7 @@ def api_update_log():
     try:
         milestone = _milestone_by_slug(conn, project["id"], slug)
         log = _update_log(conn, milestone["id"], payload)
-        _touch_project(project_key)
+
         return jsonify({"status": "ok", "log": log})
     except ValueError as exc:
         return (str(exc), 400)
@@ -916,7 +870,7 @@ def api_reset_project():
         return (str(exc), 400)
     try:
         _reset_project_data(conn, project["id"])
-        _touch_project(project_key)
+
         return jsonify({"status": "ok"})
     finally:
         conn.close()
@@ -939,6 +893,92 @@ def api_snapshot_history():
         conn.close()
 
 
+@app.get("/api/recent-changes")
+def api_recent_changes():
+    project_key = request.args.get("project")
+    limit = request.args.get("limit", "20")
+    if not project_key:
+        return ("Missing 'project' query parameter", 400)
+    try:
+        limit_int = int(limit)
+    except ValueError:
+        return ("Invalid limit parameter", 400)
+    try:
+        _, _, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        # Combine milestone updates (logs), milestone creations, and a sample of status updates
+        # We'll use a UNION to combine different event types
+        rows = conn.execute(
+            """
+            -- Milestone log entries
+            SELECT
+                'log' as event_type,
+                mu.id as event_id,
+                mu.summary,
+                mu.created_at,
+                m.id as milestone_id,
+                m.slug,
+                m.title
+            FROM milestone_updates mu
+            JOIN milestones m ON mu.milestone_id = m.id
+            WHERE m.project_id = ?
+
+            UNION ALL
+
+            -- Milestone creation events
+            SELECT
+                'created' as event_type,
+                m.id as event_id,
+                'Milestone created' as summary,
+                m.created_at,
+                m.id as milestone_id,
+                m.slug,
+                m.title
+            FROM milestones m
+            WHERE m.project_id = ?
+
+            UNION ALL
+
+            -- Milestone status changes (from updated_at being different from created_at)
+            SELECT
+                'status' as event_type,
+                m.id as event_id,
+                'Status: ' || m.status as summary,
+                m.updated_at as created_at,
+                m.id as milestone_id,
+                m.slug,
+                m.title
+            FROM milestones m
+            WHERE m.project_id = ? AND m.updated_at != m.created_at
+
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (project["id"], project["id"], project["id"], limit_int),
+        ).fetchall()
+        changes = [
+            {
+                "id": f"{row['event_type']}-{row['event_id']}",  # Unique ID combining type and ID
+                "summary": row["summary"],
+                "createdAt": row["created_at"],
+                "eventType": row["event_type"],
+                "milestone": {
+                    "id": row["milestone_id"],
+                    "slug": row["slug"],
+                    "title": row["title"],
+                },
+            }
+            for row in rows
+        ]
+        return jsonify({"changes": changes})
+    finally:
+        conn.close()
+
+
 @app.post("/api/progress/reset")
 def api_progress_reset():
     project_key = request.args.get("projectKey")
@@ -953,7 +993,7 @@ def api_progress_reset():
         return (str(exc), 400)
     try:
         snapshot = _record_snapshot(conn, project["id"], payload.get("label"))
-        _touch_project(project_key)
+
         return jsonify({
             "status": "ok",
             "snapshot": {
