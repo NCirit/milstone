@@ -761,13 +761,12 @@ def api_milestones():
         progress = _progress_stats(conn, project_id, _current_period_start(conn, project_id))
         try:
             history = state.record_project_open(
-                state_dir,
                 {
                     "key": project["key"],
                     "name": project["name"],
                     "description": project["description"],
                     "path": entry.get("path"),
-                },
+                }
             )
         except Exception:  # pragma: no cover - best-effort persistence
             history = None

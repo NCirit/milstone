@@ -11,16 +11,16 @@ SERVER_INFO_FILENAME = "server_info.json"
 GLOBAL_STATE_ROOT = Path.home() / ".milstone-server"
 
 
-def _history_path(state_dir: Path) -> Path:
-    return state_dir / WEB_HISTORY_FILENAME
+def _history_path() -> Path:
+    return _global_root() / WEB_HISTORY_FILENAME
 
 
 def _server_info_path(state_dir: Path) -> Path:
     return state_dir / SERVER_INFO_FILENAME
 
 
-def load_history(state_dir: Path) -> Dict[str, Any]:
-    path = _history_path(state_dir)
+def load_history() -> Dict[str, Any]:
+    path = _history_path()
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
@@ -29,13 +29,13 @@ def load_history(state_dir: Path) -> Dict[str, Any]:
     return {"projects": [], "current_project": None, "last_opened_at": None}
 
 
-def save_history(state_dir: Path, history: Dict[str, Any]) -> None:
-    path = _history_path(state_dir)
+def save_history(history: Dict[str, Any]) -> None:
+    path = _history_path()
     path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
 
-def record_project_open(state_dir: Path, entry: Dict[str, Any]) -> Dict[str, Any]:
-    history = load_history(state_dir)
+def record_project_open(entry: Dict[str, Any]) -> Dict[str, Any]:
+    history = load_history()
     now = datetime.now(timezone.utc).isoformat()
     entry_with_ts = {**entry, "last_opened": now}
     projects: List[Dict[str, Any]] = history.get("projects", [])
@@ -51,7 +51,7 @@ def record_project_open(state_dir: Path, entry: Dict[str, Any]) -> Dict[str, Any
     history["projects"] = projects
     history["current_project"] = entry["key"]
     history["last_opened_at"] = now
-    save_history(state_dir, history)
+    save_history(history)
     return history
 
 

@@ -30,3 +30,11 @@ Reporting & Tracking
 * `milstone service start|stop|restart --port PORT` – manage the background web service without opening the UI.
 
 Remember: the CLI is self-documenting via `--help`. Encourage models to inspect command-specific help before invoking unfamiliar options.
+
+User Instructions
+-----------------
+* Write detailed descriptions for each milestone explaining what needs to be done.
+* Only mark milestones as completed when all work is finished.
+* Split large milestones into smaller ones that can be completed quickly.
+* Use `milstone log add` to record progress updates regularly.
+* Review milestone status frequently to keep tracking accurate.

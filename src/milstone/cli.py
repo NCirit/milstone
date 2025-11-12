@@ -571,7 +571,7 @@ def _ensure_web_server(requested_port: int) -> Dict[str, int]:
 
 
 def _record_project_history(state_dir: Path, entry: Dict[str, str]) -> None:
-    state.record_project_open(state_dir, entry)
+    state.record_project_open(entry)
 
 
 def _fetch_project_info(conn: sqlite3.Connection, project_id: int) -> Dict[str, Optional[str]]:
@@ -696,6 +696,7 @@ def project_init(
 
     _dump_llm_usage(state_dir)
     typer.echo(f"Initialization complete: .milstone assets ready for '{project_name}' ({project_key}).")
+    typer.echo(f"Note: You can customize the 'User Instructions' section in .milstone/{LLM_USAGE_FILENAME} to add your own guidelines for LLM models.")
 
 
 @project_app.command("report")
