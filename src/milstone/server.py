@@ -81,6 +81,7 @@ def _maybe_add_column(conn: sqlite3.Connection, table: str, column: str, column_
 def _normalize_statuses(conn: sqlite3.Connection) -> None:
     with conn:
         conn.execute("UPDATE milestones SET status = 'active' WHERE status = 'planned'")
+        conn.execute("UPDATE milestones SET status = 'done' WHERE status = 'completed'")
 
 
 def _ensure_log_sequences(conn: sqlite3.Connection) -> None:
@@ -257,6 +258,8 @@ def _canonical_status(value: Optional[str]) -> str:
     value = value.strip().lower()
     if value == "planned":
         return "active"
+    if value == "completed":
+        return "done"
     return value
 
 

@@ -43,7 +43,7 @@ const toastEl = document.getElementById('toast');
 const STATUS_VALUES = ['active', 'blocked', 'on_hold', 'done'];
 const STATUS_COLOR_CLASS = {
   active: 'status-green',
-  done: 'status-green',
+  done: 'status-gray',
   blocked: 'status-red',
   on_hold: 'status-yellow',
   deleted: 'status-gray',
@@ -52,7 +52,9 @@ const STATUS_COLOR_CLASS = {
 const canonicalStatusValue = (value) => {
   if (!value) return 'active';
   const lower = value.toLowerCase();
-  return lower === 'planned' ? 'active' : lower;
+  if (lower === 'planned') return 'active';
+  if (lower === 'completed') return 'done';
+  return lower;
 };
 
 const formatStatusLabel = (value) => {
