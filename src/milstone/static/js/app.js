@@ -14,6 +14,7 @@ const state = {
   statusFilter: 'all',
   recentChanges: [],
   lastChangeIds: new Set(),
+  lastMilestoneHash: null,
   pollingInterval: null,
 };
 
@@ -259,19 +260,40 @@ const loadSnapshots = async () => {
   return state.snapshots;
 };
 
-const loadMilestones = async () => {
+// Simple hash function to detect milestone changes
+const computeMilestoneHash = (milestones) => {
+  return JSON.stringify(milestones);
+};
+
+const loadMilestones = async (silent = false) => {
   if (!state.currentProject) {
     state.milestones = [];
     state.progress = null;
+    state.lastMilestoneHash = null;
     return;
   }
   const params = new URLSearchParams({ project: state.currentProject });
   if (state.statusFilter === 'deleted') params.append('include_deleted', 'true');
   const data = await fetchJSON(`/api/milestones?${params.toString()}`);
-  state.milestones = data.milestones || [];
+  const newMilestones = data.milestones || [];
+  const newHash = computeMilestoneHash(newMilestones);
+
+  // Check if milestones have changed
+  if (silent && state.lastMilestoneHash !== null && newHash !== state.lastMilestoneHash) {
+    state.milestones = newMilestones;
+    annotateTotals(state.milestones);
+    pruneExpanded();
+    state.progress = data.progress || null;
+    state.lastMilestoneHash = newHash;
+    renderMain();
+    return;
+  }
+
+  state.milestones = newMilestones;
   annotateTotals(state.milestones);
   pruneExpanded();
   state.progress = data.progress || null;
+  state.lastMilestoneHash = newHash;
 };
 
 const loadRecentChanges = async (silent = false) => {
@@ -1085,7 +1107,7 @@ mainEl.addEventListener('change', (event) => {
   }
 });
 
-// Start polling for recent changes
+// Start polling for recent changes and milestones
 const startRecentChangesPolling = () => {
   // Clear any existing polling
   if (state.pollingInterval) {
@@ -1095,6 +1117,7 @@ const startRecentChangesPolling = () => {
   // Poll every 10 seconds
   state.pollingInterval = setInterval(async () => {
     if (state.currentProject) {
+      await loadMilestones(true); // true = silent, will re-render if changed
       await loadRecentChanges(false); // false = not silent, will play sound for new changes
     }
   }, 10000);
