@@ -30,7 +30,8 @@ milstone = [
   "templates/*.html",
   "static/css/*.css",
   "static/js/*.js",
-  "data/*.txt"
+  "data/*.txt",
+  "data/*.yml"
 ]
 
 [tool.setuptools]

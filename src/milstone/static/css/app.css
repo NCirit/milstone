@@ -70,6 +70,7 @@ body {
   flex-wrap: wrap;
 }
 
+
 .progress-metrics {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -366,6 +367,10 @@ body {
   padding-top: 0.6rem;
 }
 
+.node-links {
+  margin-top: 0.5rem;
+}
+
 .node-description {
   margin: 0.6rem 0;
   color: #cbd5f5;
@@ -537,6 +542,228 @@ body {
 .snapshot-list li {
   margin-bottom: 0.8rem;
   color: #cbd5f5;
+}
+
+.decisions-section {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.25rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.75);
+  box-shadow: 0 10px 25px rgba(2, 6, 23, 0.45);
+}
+
+
+.decision-timeline {
+  overflow-x: auto;
+  padding: 1rem 0.5rem;
+  border-radius: 1rem;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.decision-track {
+  position: relative;
+  height: 120px;
+}
+
+.decision-line {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, rgba(148, 163, 184, 0.1), rgba(148, 163, 184, 0.5), rgba(148, 163, 184, 0.1));
+}
+
+.decision-dot {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  border: 2px solid rgba(15, 23, 42, 0.8);
+  cursor: pointer;
+  box-shadow: 0 0 12px rgba(15, 23, 42, 0.6);
+}
+
+.decision-dot.level-1 {
+  width: 12px;
+  height: 12px;
+}
+
+.decision-dot.level-2 {
+  width: 16px;
+  height: 16px;
+}
+
+.decision-dot.level-3 {
+  width: 20px;
+  height: 20px;
+}
+
+.decision-dot.level-4 {
+  width: 24px;
+  height: 24px;
+}
+
+.decision-green {
+  background: #22c55e;
+}
+
+.decision-gray {
+  background: #94a3b8;
+}
+
+.decision-red {
+  background: #ef4444;
+}
+
+.decision-yellow {
+  background: #f59e0b;
+}
+
+.decision-blue {
+  background: #38bdf8;
+}
+
+.decision-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 0.3rem;
+}
+
+.decision-tooltip {
+  position: absolute;
+  z-index: 1001;
+  padding: 0.7rem 0.9rem;
+  border-radius: 0.8rem;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: #e2e8f0;
+  font-size: 0.75rem;
+  width: 220px;
+  box-shadow: 0 20px 35px rgba(0, 0, 0, 0.4);
+}
+
+.decision-tooltip.hidden {
+  display: none;
+}
+
+.tooltip-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+
+.tooltip-meta,
+.tooltip-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  color: #cbd5f5;
+}
+
+.tooltip-date {
+  margin-top: 0.4rem;
+  color: #94a3b8;
+}
+
+.status-pill {
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  color: #0f172a;
+  background: #e2e8f0;
+}
+
+.status-pill.decision-green {
+  background: #22c55e;
+  color: #052e16;
+}
+
+.status-pill.decision-gray {
+  background: #94a3b8;
+  color: #0f172a;
+}
+
+.status-pill.decision-red {
+  background: #ef4444;
+  color: #2c0b0b;
+}
+
+.status-pill.decision-yellow {
+  background: #f59e0b;
+  color: #2b1603;
+}
+
+.status-pill.decision-blue {
+  background: #38bdf8;
+  color: #082f49;
+}
+
+.decision-modal-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.decision-modal-header h3 {
+  margin: 0;
+}
+
+.decision-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  color: #cbd5f5;
+  font-size: 0.85rem;
+}
+
+.decision-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.decision-modal-body section {
+  background: rgba(15, 23, 42, 0.55);
+  padding: 0.8rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.decision-modal-body h4 {
+  margin: 0 0 0.4rem 0;
+}
+
+.decision-relations {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.decision-relations ul,
+.decision-milestones ul {
+  margin: 0.4rem 0 0 0;
+  padding-left: 1rem;
+  color: #cbd5f5;
+}
+
+.decision-rel-group h4 {
+  margin: 0 0 0.4rem 0;
 }
 .progressCard {
   margin: 1.5rem 0;

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import getpass
 import re
 import signal
 import sqlite3
@@ -29,16 +30,21 @@ milestone_app = typer.Typer(help="Create, update, and list milestones")
 log_app = typer.Typer(help="Manage milestone logs")
 progress_app = typer.Typer(help="Progress tracking commands")
 service_app = typer.Typer(help="Background service utilities")
+decision_app = typer.Typer(help="Track architectural decisions")
 
 STATE_DIR_NAME = ".milstone"
 DB_FILENAME = "milstone.db"
 STATUS_MD_FILENAME = "milstone_status.md"
 LLM_USAGE_FILENAME = "llm_instructions.txt"
+DECISION_POLICY_FILENAME = "decision_policy.yml"
 LLM_TEMPLATE_PATH = Path(__file__).resolve().parent / "data" / "llm_instructions_template.txt"
+DECISION_POLICY_TEMPLATE_PATH = Path(__file__).resolve().parent / "data" / "decision_policy_template.yml"
 SERVER_MODULE_PATH = "milstone.server"
 DEFAULT_EXPECTED_HOURS = 1.0
 MILSTONE_SERVER_PORT = 8123  # Hardcoded port for Milstone server
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
+DECISION_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
+DECISION_RELATION_TYPES = {"made_for", "affects", "implements", "blocked_by"}
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -120,6 +126,107 @@ CREATE TABLE IF NOT EXISTS audit_log (
     payload TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'accepted'
+        CHECK(status IN ('proposed','accepted','rejected','deprecated','superseded')),
+    required_level INTEGER NOT NULL,
+    maker TEXT NOT NULL,
+    maker_level INTEGER NOT NULL,
+    context TEXT,
+    decision TEXT NOT NULL,
+    alternatives TEXT,
+    consequences TEXT,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS decision_overrides (
+    overriding_decision_id INTEGER NOT NULL,
+    overridden_decision_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (overriding_decision_id, overridden_decision_id),
+    CHECK (overriding_decision_id <> overridden_decision_id),
+    FOREIGN KEY (overriding_decision_id) REFERENCES decisions(decision_id) ON DELETE CASCADE,
+    FOREIGN KEY (overridden_decision_id) REFERENCES decisions(decision_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS milestone_decisions (
+    milestone_id INTEGER NOT NULL REFERENCES milestones(id) ON DELETE CASCADE,
+    decision_id INTEGER NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL DEFAULT 'made_for'
+        CHECK(relation_type IN ('made_for','affects','implements','blocked_by')),
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (milestone_id, decision_id, relation_type)
+);
+
+CREATE TABLE IF NOT EXISTS decision_override_requests (
+    request_id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    requester TEXT NOT NULL,
+    requester_level INTEGER NOT NULL,
+    target_decision_id INTEGER NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,
+    message TEXT NOT NULL,
+    proposed_summary TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','approved','rejected')),
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);
+CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at);
+CREATE INDEX IF NOT EXISTS idx_overrides_overriding ON decision_overrides(overriding_decision_id);
+CREATE INDEX IF NOT EXISTS idx_overrides_overridden ON decision_overrides(overridden_decision_id);
+CREATE INDEX IF NOT EXISTS idx_milestone_decisions_mid ON milestone_decisions(milestone_id);
+CREATE INDEX IF NOT EXISTS idx_milestone_decisions_did ON milestone_decisions(decision_id);
+CREATE INDEX IF NOT EXISTS idx_decision_override_requests_project ON decision_override_requests(project_id);
+CREATE INDEX IF NOT EXISTS idx_decision_override_requests_status ON decision_override_requests(status);
+
+CREATE TRIGGER IF NOT EXISTS trg_override_authority
+BEFORE INSERT ON decision_overrides
+BEGIN
+    SELECT CASE
+        WHEN (SELECT maker_level FROM decisions WHERE decision_id = NEW.overriding_decision_id)
+           <= (SELECT required_level FROM decisions WHERE decision_id = NEW.overridden_decision_id)
+        THEN RAISE(ABORT, 'Insufficient authority to override this decision')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_override_no_cycles
+BEFORE INSERT ON decision_overrides
+BEGIN
+    WITH RECURSIVE chain(id) AS (
+        SELECT NEW.overridden_decision_id
+        UNION ALL
+        SELECT o.overridden_decision_id
+        FROM decision_overrides o
+        JOIN chain c ON o.overriding_decision_id = c.id
+    )
+    SELECT CASE
+        WHEN EXISTS (SELECT 1 FROM chain WHERE id = NEW.overriding_decision_id)
+        THEN RAISE(ABORT, 'Override cycle detected')
+    END;
+END;
+
+CREATE VIEW IF NOT EXISTS active_decisions AS
+SELECT d.*
+FROM decisions d
+WHERE d.status = 'accepted'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM decision_overrides o
+    JOIN decisions newer ON newer.decision_id = o.overriding_decision_id
+    WHERE o.overridden_decision_id = d.decision_id
+      AND newer.status = 'accepted'
+  );
 """
 
 
@@ -164,6 +271,52 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 def _state_dir(base_path: Path) -> Path:
     return base_path / STATE_DIR_NAME
+
+
+def _decision_policy_path(base_path: Path) -> Path:
+    return _state_dir(base_path) / DECISION_POLICY_FILENAME
+
+
+def _load_decision_policy(base_path: Path) -> Dict[str, int]:
+    path = _decision_policy_path(base_path)
+    if not path.exists():
+        return {}
+    users: Dict[str, int] = {}
+    in_users = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("users:"):
+            in_users = True
+            continue
+        if not in_users:
+            continue
+        if line and not line.startswith((" ", "\t")):
+            in_users = False
+            continue
+        if ":" not in stripped:
+            continue
+        name, value = stripped.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        try:
+            level = int(value)
+        except ValueError:
+            continue
+        users[name] = level
+    return users
+
+
+def _maker_level_for(base_path: Path, maker: str) -> int:
+    policy = _load_decision_policy(base_path)
+    level = policy.get(maker, 1)
+    if level < 1 or level > 4:
+        raise typer.BadParameter(f"Invalid authority level {level} for maker '{maker}' in decision policy.")
+    return level
 
 
 def _find_state_dir(start: Path) -> Optional[Path]:
@@ -223,6 +376,17 @@ def _dump_llm_usage(target_dir: Path) -> None:
         template.format(status_md=STATUS_MD_FILENAME),
         encoding="utf-8",
     )
+
+
+def _dump_decision_policy(target_dir: Path) -> None:
+    policy_file = target_dir / DECISION_POLICY_FILENAME
+    if policy_file.exists():
+        return
+    try:
+        template = DECISION_POLICY_TEMPLATE_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        template = "users:\n  admin: 4\n  llm: 1\n"
+    policy_file.write_text(template, encoding="utf-8")
 
 
 def _ensure_flask_available() -> None:
@@ -342,6 +506,20 @@ def _canonical_status(value: Optional[str]) -> str:
     if value == "completed":
         return "done"
     return value
+
+
+def _decision_status(value: Optional[str]) -> str:
+    status = (value or "accepted").strip().lower()
+    if status not in DECISION_STATUSES:
+        raise typer.BadParameter(f"Invalid decision status '{status}'.")
+    return status
+
+
+def _relation_type(value: Optional[str]) -> str:
+    relation = (value or "made_for").strip().lower()
+    if relation not in DECISION_RELATION_TYPES:
+        raise typer.BadParameter(f"Invalid relation type '{relation}'.")
+    return relation
 
 
 def _auto_completed_at(status: str, existing: Optional[str]) -> Optional[str]:
@@ -708,6 +886,7 @@ def project_init(
         conn.close()
 
     _dump_llm_usage(state_dir)
+    _dump_decision_policy(state_dir)
     typer.echo(f"Initialization complete: .milstone assets ready for '{project_name}'.")
     typer.echo(f"Note: You can customize the 'User Instructions' section in .milstone/{LLM_USAGE_FILENAME} to add your own guidelines for LLM models.")
 
@@ -988,6 +1167,7 @@ def list_milestones(
 app.add_typer(project_app, name="project")
 app.add_typer(milestone_app, name="milestone")
 app.add_typer(log_app, name="log")
+app.add_typer(decision_app, name="decision")
 
 
 @log_app.command("add")
@@ -1082,6 +1262,383 @@ def logs_edit(
         conn.close()
 
     typer.echo("Log entry updated.")
+
+
+def _parse_id_list(value: str) -> List[int]:
+    items = [chunk.strip() for chunk in value.replace(" ", ",").split(",") if chunk.strip()]
+    ids: List[int] = []
+    for item in items:
+        try:
+            ids.append(int(item))
+        except ValueError as exc:
+            raise typer.BadParameter(f"Invalid decision id '{item}'.") from exc
+    return ids
+
+
+@decision_app.command("add")
+def decision_add(
+    title: str = typer.Argument(..., help="Decision title"),
+    decision_text: str = typer.Argument(..., help="Decision statement"),
+    required_level: int = typer.Option(..., "--required-level", min=1, max=4, help="Required authority level (1-4)"),
+    path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
+    maker: Optional[str] = typer.Option(None, "--maker", help="Decision maker (defaults to current user)"),
+    status: str = typer.Option("accepted", "--status", help="Decision status"),
+    context: Optional[str] = typer.Option(None, "--context", help="Decision context"),
+    alternatives: Optional[str] = typer.Option(None, "--alternatives", help="Alternatives considered"),
+    consequences: Optional[str] = typer.Option(None, "--consequences", help="Decision consequences"),
+    tags: Optional[str] = typer.Option(None, "--tags", help="Tags (csv or json string)"),
+    milestone: Optional[str] = typer.Option(None, "--milestone", help="Milestone slug to link"),
+    relation_type: str = typer.Option("made_for", "--relation-type", help="Milestone relation type"),
+) -> None:
+    """Create a new decision entry."""
+    project_root = path.resolve()
+    conn = _connect_existing(project_root)
+    try:
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        maker_name = maker or getpass.getuser()
+        maker_level = _maker_level_for(project_root, maker_name)
+        status_value = _decision_status(status)
+        relation_value = _relation_type(relation_type)
+        with conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO decisions (
+                    project_id, title, status, required_level, maker, maker_level,
+                    context, decision, alternatives, consequences, tags
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    title,
+                    status_value,
+                    required_level,
+                    maker_name,
+                    maker_level,
+                    context,
+                    decision_text,
+                    alternatives,
+                    consequences,
+                    tags,
+                ),
+            )
+            decision_id = cursor.lastrowid
+            if milestone:
+                milestone_row = _lookup_milestone(conn, project_id, milestone, include_deleted=True)
+                if milestone_row is None:
+                    raise typer.BadParameter(f"Milestone '{milestone}' not found.")
+                conn.execute(
+                    """
+                    INSERT INTO milestone_decisions (milestone_id, decision_id, relation_type)
+                    VALUES (?, ?, ?)
+                    """,
+                    (milestone_row["id"], decision_id, relation_value),
+                )
+    finally:
+        conn.close()
+
+    typer.echo(f"Created decision {decision_id}.")
+
+
+@decision_app.command("list")
+def decision_list(
+    path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by decision status"),
+    maker: Optional[str] = typer.Option(None, "--maker", help="Filter by maker"),
+    required_level: Optional[int] = typer.Option(None, "--required-level", min=1, max=4, help="Filter by required level"),
+    milestone: Optional[str] = typer.Option(None, "--milestone", help="Filter by milestone slug"),
+    search: Optional[str] = typer.Option(None, "--search", help="Search title or tags"),
+) -> None:
+    """List decisions for a project."""
+    project_root = path.resolve()
+    conn = _connect_existing(project_root)
+    try:
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        params: List[object] = [project_id]
+        where_clauses = ["d.project_id = ?"]
+        if status:
+            where_clauses.append("d.status = ?")
+            params.append(_decision_status(status))
+        if maker:
+            where_clauses.append("d.maker = ?")
+            params.append(maker)
+        if required_level:
+            where_clauses.append("d.required_level = ?")
+            params.append(required_level)
+        if search:
+            where_clauses.append("(d.title LIKE ? OR d.tags LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        join_clause = ""
+        if milestone:
+            milestone_row = _lookup_milestone(conn, project_id, milestone, include_deleted=True)
+            if milestone_row is None:
+                raise typer.BadParameter(f"Milestone '{milestone}' not found.")
+            join_clause = "JOIN milestone_decisions md ON md.decision_id = d.decision_id"
+            where_clauses.append("md.milestone_id = ?")
+            params.append(milestone_row["id"])
+
+        query = f"""
+            SELECT DISTINCT d.*,
+                (SELECT COUNT(*) FROM decision_overrides o WHERE o.overriding_decision_id = d.decision_id) AS overrides_count,
+                (SELECT COUNT(*) FROM decision_overrides o WHERE o.overridden_decision_id = d.decision_id) AS overridden_by_count,
+                (SELECT COUNT(DISTINCT milestone_id) FROM milestone_decisions md2 WHERE md2.decision_id = d.decision_id) AS linked_milestones
+            FROM decisions d
+            {join_clause}
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY d.created_at DESC
+        """
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo("No decisions found.")
+        return
+
+    table = Table(title="Decisions")
+    table.add_column("ID", style="cyan", justify="right")
+    table.add_column("Title")
+    table.add_column("Status")
+    table.add_column("Req")
+    table.add_column("Maker")
+    table.add_column("Created")
+    table.add_column("Overrides", justify="right")
+    table.add_column("Overridden By", justify="right")
+    table.add_column("Milestones", justify="right")
+    for row in rows:
+        table.add_row(
+            str(row["decision_id"]),
+            row["title"],
+            row["status"],
+            str(row["required_level"]),
+            row["maker"],
+            row["created_at"],
+            str(row["overrides_count"]),
+            str(row["overridden_by_count"]),
+            str(row["linked_milestones"]),
+        )
+    rprint(table)
+
+
+@decision_app.command("show")
+def decision_show(
+    decision_id: int = typer.Argument(..., help="Decision id"),
+    path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
+    tree: bool = typer.Option(False, "--tree", help="Show override relationships as a tree"),
+) -> None:
+    """Show details for a decision."""
+    project_root = path.resolve()
+    conn = _connect_existing(project_root)
+    try:
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        decision = conn.execute(
+            "SELECT * FROM decisions WHERE project_id = ? AND decision_id = ?",
+            (project_id, decision_id),
+        ).fetchone()
+        if decision is None:
+            raise typer.BadParameter(f"Decision {decision_id} not found.")
+        overrides = conn.execute(
+            """
+            SELECT d.decision_id, d.title, d.status
+            FROM decision_overrides o
+            JOIN decisions d ON d.decision_id = o.overridden_decision_id
+            WHERE o.overriding_decision_id = ?
+            ORDER BY d.decision_id
+            """,
+            (decision_id,),
+        ).fetchall()
+        overridden_by = conn.execute(
+            """
+            SELECT d.decision_id, d.title, d.status
+            FROM decision_overrides o
+            JOIN decisions d ON d.decision_id = o.overriding_decision_id
+            WHERE o.overridden_decision_id = ?
+            ORDER BY d.decision_id
+            """,
+            (decision_id,),
+        ).fetchall()
+        milestones = conn.execute(
+            """
+            SELECT m.slug, m.title, md.relation_type, md.note
+            FROM milestone_decisions md
+            JOIN milestones m ON m.id = md.milestone_id
+            WHERE md.decision_id = ?
+            ORDER BY md.relation_type, m.slug
+            """,
+            (decision_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if tree:
+        root = Tree(f"[bold]Decision {decision_id}[/bold]: {decision['title']}")
+        overrides_branch = root.add("Overrides")
+        if overrides:
+            for row in overrides:
+                overrides_branch.add(f"{row['decision_id']} — {row['title']} ({row['status']})")
+        else:
+            overrides_branch.add("None")
+        overridden_branch = root.add("Overridden by")
+        if overridden_by:
+            for row in overridden_by:
+                overridden_branch.add(f"{row['decision_id']} — {row['title']} ({row['status']})")
+        else:
+            overridden_branch.add("None")
+        milestones_branch = root.add("Milestones")
+        if milestones:
+            for row in milestones:
+                label = f"{row['relation_type']}: {row['title']} ({row['slug']})"
+                if row["note"]:
+                    label += f" — {row['note']}"
+                milestones_branch.add(label)
+        else:
+            milestones_branch.add("None")
+        rprint(root)
+        return
+
+    typer.echo(f"Decision {decision_id}: {decision['title']}")
+    typer.echo(f"Status: {decision['status']}")
+    typer.echo(f"Required level: L{decision['required_level']}")
+    typer.echo(f"Maker: {decision['maker']} (L{decision['maker_level']})")
+    typer.echo(f"Created: {decision['created_at']}")
+    if decision["context"]:
+        typer.echo(f"Context: {decision['context']}")
+    typer.echo(f"Decision: {decision['decision']}")
+    if decision["alternatives"]:
+        typer.echo(f"Alternatives: {decision['alternatives']}")
+    if decision["consequences"]:
+        typer.echo(f"Consequences: {decision['consequences']}")
+    if decision["tags"]:
+        typer.echo(f"Tags: {decision['tags']}")
+    if overrides:
+        typer.echo("Overrides: " + ", ".join(str(row["decision_id"]) for row in overrides))
+    if overridden_by:
+        typer.echo("Overridden by: " + ", ".join(str(row["decision_id"]) for row in overridden_by))
+    if milestones:
+        typer.echo("Milestones:")
+        for row in milestones:
+            label = f"- {row['relation_type']}: {row['title']} ({row['slug']})"
+            if row["note"]:
+                label += f" — {row['note']}"
+            typer.echo(label)
+
+
+@decision_app.command("link")
+def decision_link(
+    decision_id: int = typer.Argument(..., help="Decision id"),
+    milestone: str = typer.Argument(..., help="Milestone slug"),
+    path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
+    relation_type: str = typer.Option("affects", "--relation-type", help="Relation type"),
+    note: Optional[str] = typer.Option(None, "--note", help="Optional note"),
+) -> None:
+    """Link a decision to a milestone."""
+    project_root = path.resolve()
+    conn = _connect_existing(project_root)
+    try:
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        decision = conn.execute(
+            "SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id = ?",
+            (project_id, decision_id),
+        ).fetchone()
+        if decision is None:
+            raise typer.BadParameter(f"Decision {decision_id} not found.")
+        milestone_row = _lookup_milestone(conn, project_id, milestone, include_deleted=True)
+        if milestone_row is None:
+            raise typer.BadParameter(f"Milestone '{milestone}' not found.")
+        relation_value = _relation_type(relation_type)
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO milestone_decisions (milestone_id, decision_id, relation_type, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (milestone_row["id"], decision_id, relation_value, note),
+            )
+    finally:
+        conn.close()
+
+    typer.echo(f"Linked decision {decision_id} to milestone '{milestone}'.")
+
+
+@decision_app.command("override")
+def decision_override(
+    decision_id: int = typer.Argument(..., help="Overriding decision id"),
+    overrides: str = typer.Option(..., "--overrides", help="Comma-separated decision ids to override"),
+    path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
+) -> None:
+    """Record override relationships for a decision."""
+    override_ids = _parse_id_list(overrides)
+    project_root = path.resolve()
+    conn = _connect_existing(project_root)
+    try:
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        decision = conn.execute(
+            "SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id = ?",
+            (project_id, decision_id),
+        ).fetchone()
+        if decision is None:
+            raise typer.BadParameter(f"Decision {decision_id} not found.")
+        placeholders = ",".join("?" for _ in override_ids)
+        rows = conn.execute(
+            f"SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id IN ({placeholders})",
+            [project_id, *override_ids],
+        ).fetchall()
+        found = {row["decision_id"] for row in rows}
+        missing = [str(item) for item in override_ids if item not in found]
+        if missing:
+            raise typer.BadParameter(f"Override target(s) not found: {', '.join(missing)}")
+        with conn:
+            for target_id in override_ids:
+                conn.execute(
+                    "INSERT INTO decision_overrides (overriding_decision_id, overridden_decision_id) VALUES (?, ?)",
+                    (decision_id, target_id),
+                )
+    finally:
+        conn.close()
+
+    typer.echo(f"Decision {decision_id} now overrides {', '.join(str(i) for i in override_ids)}.")
+
+
+@decision_app.command("request-override")
+def decision_request_override(
+    target_decision_id: int = typer.Argument(..., help="Target decision id"),
+    message: str = typer.Argument(..., help="Override request message"),
+    path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
+    requester: Optional[str] = typer.Option(None, "--requester", help="Requester name"),
+    proposed_summary: Optional[str] = typer.Option(None, "--proposed-summary", help="Optional summary of proposal"),
+) -> None:
+    """Request an override escalation."""
+    project_root = path.resolve()
+    conn = _connect_existing(project_root)
+    try:
+        project_id = _resolve_project_fields(conn, None, None, create_if_missing=False)
+        decision = conn.execute(
+            "SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id = ?",
+            (project_id, target_decision_id),
+        ).fetchone()
+        if decision is None:
+            raise typer.BadParameter(f"Decision {target_decision_id} not found.")
+        requester_name = requester or getpass.getuser()
+        requester_level = _maker_level_for(project_root, requester_name)
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO decision_override_requests (
+                    project_id, requester, requester_level, target_decision_id, message, proposed_summary
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    requester_name,
+                    requester_level,
+                    target_decision_id,
+                    message,
+                    proposed_summary,
+                ),
+            )
+    finally:
+        conn.close()
+
+    typer.echo(f"Override request recorded for decision {target_decision_id}.")
 def _format_stats(stats: Dict[str, float]) -> str:
     percent = round(stats["ratio"] * 100, 2) if stats["ratio"] else 0.0
     return (

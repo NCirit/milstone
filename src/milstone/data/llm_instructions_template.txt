@@ -2,41 +2,23 @@ Milstone CLI – LLM Usage Notes
 ================================
 
 This file is generated automatically inside each project's `.milstone/` directory so language models
-understand how to operate the tool safely. Run any command with `--help` to see the complete option set before invoking it.
-Never edit files under `.milstone/` or `milstone_status.md` directly—always use the commands below.
+understand how to operate the tool safely. Use `milstone --help` or `milstone <command> --help` to see the full option set.
+Never edit files under `.milstone/` or `{status_md}` directly—always use Milstone commands.
 
-Setup & Project Management
---------------------------
-1. `milstone project init "Project Name" PATH` – create `.milstone/` and initialize the project.
-2. `milstone project report [--output PATH]` – write "{status_md}" describing the active progress term.
-3. `milstone project ui` – launch the background Flask UI / web dashboard.
+Milestones (High-Level)
+-----------------------
+* Create milestones with clear titles, descriptions, owners, and expected hours.
+* Milestone descriptions must state what has to be done so they can serve as acceptance/done criteria later.
+* Keep milestones small and actionable; split large work into smaller milestones.
+* Update status, priority, and parent relationships as work evolves.
+* Log progress regularly with short, specific summaries; include what was done and, if available, the related commit.
+* Only mark milestones done when work is truly complete.
 
-Milestone Lifecycle
--------------------
-* `milstone milestone add "Title" --status active --expected-hours 2 --parent parent-slug` – create work items (status defaults to "active").
-* `milstone milestone update <slug>` with flags such as `--status`, `--parent` / `--clear-parent`, `--deleted/--undeleted`, `--expected-hours`.
-* `milstone milestone list [--status ...] [--include-deleted]` – inspect the milestone tree via the CLI.
-
-Logging Progress
-----------------
-* `milstone log add <slug> "Short summary"` – append textual updates.
-* `milstone log list <slug>` – review existing updates.
-* `milstone log edit <slug> --index N --summary "Revised note"` (or `--log-id ID`).
-
-Reporting & Tracking
---------------------
-* `milstone project report` produces the Markdown snapshot consumed by dashboards.
-* `milstone progress show | reset | history` – inspect period totals, reset them, or review prior snapshots.
-* `milstone service start|stop|restart|status|logs` – manage the background web service on port 8123 (only one instance allowed).
-  - Server logs are stored in `~/.milstone-server/server.log`
-  - Use `milstone service logs` to view the log file location.
-
-Remember: the CLI is self-documenting via `--help`. Encourage models to inspect command-specific help before invoking unfamiliar options.
-
-User Instructions
------------------
-* Write detailed descriptions for each milestone explaining what needs to be done.
-* Only mark milestones as completed when all work is finished.
-* Split large milestones into smaller ones that can be completed quickly.
-* Use `milstone log add` to record progress updates regularly.
-* Review milestone status frequently to keep tracking accurate.
+Decisions (High-Level)
+----------------------
+* Record decisions that have long-term impact, constraints, or meaningful trade-offs.
+* Include context, the decision itself, alternatives, and consequences when available.
+* Default authority levels: `llm` is the lowest level, `admin` is the highest level.
+* Decisions made by the prompter should use the `admin` user; decisions made by the LLM should use the `llm` user.
+* Link decisions to milestones to show what they affect or implement.
+* Use overrides to supersede prior decisions while preserving history.

@@ -10,6 +10,8 @@ const state = {
   milestones: [],
   snapshots: [],
   progress: null,
+  decisions: [],
+  decisionStatusFilter: 'all',
   expanded: new Set(),
   statusFilter: 'all',
   recentChanges: [],
@@ -41,6 +43,9 @@ const sidebarEl = document.getElementById('sidebar');
 const mainEl = document.getElementById('main');
 const modalsEl = document.getElementById('modals');
 const toastEl = document.getElementById('toast');
+const decisionTooltip = document.createElement('div');
+decisionTooltip.className = 'decision-tooltip hidden';
+document.body.appendChild(decisionTooltip);
 const STATUS_VALUES = ['active', 'blocked', 'on_hold', 'done'];
 const STATUS_COLOR_CLASS = {
   active: 'status-green',
@@ -48,6 +53,13 @@ const STATUS_COLOR_CLASS = {
   blocked: 'status-red',
   on_hold: 'status-yellow',
   deleted: 'status-gray',
+};
+const DECISION_STATUS_CLASS = {
+  proposed: 'decision-gray',
+  accepted: 'decision-green',
+  rejected: 'decision-red',
+  deprecated: 'decision-yellow',
+  superseded: 'decision-blue',
 };
 
 const canonicalStatusValue = (value) => {
@@ -167,6 +179,38 @@ const findLog = (slug, logId) => {
   const node = findMilestoneBySlug(slug);
   if (!node) return null;
   return (node.logs || []).find((log) => log.id === logId) || null;
+};
+
+const findDecisionById = (decisionId) =>
+  state.decisions.find((decision) => decision.decision_id === decisionId) || null;
+
+const showDecisionTooltip = (decision, target) => {
+  if (!decision || !target) return;
+  decisionTooltip.innerHTML = `
+    <div class="tooltip-title">${escapeHtml(decision.title)}</div>
+    <div class="tooltip-meta">
+      <span class="status-pill ${DECISION_STATUS_CLASS[decision.status] || 'decision-gray'}">${formatStatusLabel(decision.status)}</span>
+      <span>L${decision.required_level}</span>
+      <span>${escapeHtml(decision.maker)}</span>
+    </div>
+    <div class="tooltip-stats">
+      <span>Overrides ${decision.override_counts?.overrides ?? 0}</span>
+      <span>Overridden by ${decision.override_counts?.overridden_by ?? 0}</span>
+      <span>Milestones ${decision.linked_milestones ?? 0}</span>
+    </div>
+    <div class="tooltip-date">${formatDateTime(decision.created_at)}</div>
+  `;
+  decisionTooltip.classList.remove('hidden');
+  const rect = target.getBoundingClientRect();
+  const tooltipRect = decisionTooltip.getBoundingClientRect();
+  const top = window.scrollY + rect.top - tooltipRect.height - 12;
+  const left = window.scrollX + rect.left - tooltipRect.width / 2 + rect.width / 2;
+  decisionTooltip.style.top = `${Math.max(top, window.scrollY + 12)}px`;
+  decisionTooltip.style.left = `${Math.max(left, 12)}px`;
+};
+
+const hideDecisionTooltip = () => {
+  decisionTooltip.classList.add('hidden');
 };
 
 const templates = {
@@ -296,6 +340,24 @@ const loadMilestones = async (silent = false) => {
   state.lastMilestoneHash = newHash;
 };
 
+const buildDecisionQuery = (statusFilter) => {
+  const params = new URLSearchParams({ project: state.currentProject });
+  if (statusFilter && statusFilter !== 'all') {
+    params.set('status', statusFilter);
+  }
+  return params.toString();
+};
+
+const loadDecisions = async (statusFilter = null) => {
+  if (!state.currentProject) {
+    state.decisions = [];
+    return;
+  }
+  const query = buildDecisionQuery(statusFilter || state.decisionStatusFilter);
+  const data = await fetchJSON(`/api/decisions?${query}`);
+  state.decisions = data || [];
+};
+
 const loadRecentChanges = async (silent = false) => {
   if (!state.currentProject) {
     state.recentChanges = [];
@@ -394,6 +456,7 @@ const renderSidebar = () => {
 };
 
 const renderMain = () => {
+  hideDecisionTooltip();
   const project = state.projects.find((p) => p.key === state.currentProject);
   if (!project) {
     mainEl.innerHTML = `
@@ -407,6 +470,12 @@ const renderMain = () => {
   const percent = Math.round((state.progress?.stats?.ratio || 0) * 100);
   const filtered = filterMilestones(state.milestones, state.statusFilter);
   const tree = renderTree(filtered);
+  const content = `
+    ${renderDecisionsSection()}
+    ${renderProgressSection(percent)}
+    ${renderRecentChangesSection()}
+    ${renderMilestoneSection(tree)}
+  `;
 
   mainEl.innerHTML = `
     <section class="project-overview">
@@ -419,9 +488,7 @@ const renderMain = () => {
         <button class="button danger" data-action="reset-project">Reset Project</button>
       </div>
     </section>
-    ${renderProgressSection(percent)}
-    ${renderRecentChangesSection()}
-    ${renderMilestoneSection(tree)}
+    ${content}
   `;
 };
 
@@ -555,6 +622,82 @@ function renderMilestoneSection(tree) {
   `;
 }
 
+const renderDecisionTimeline = (decisions) => {
+  if (!decisions.length) {
+    return '<div class="node node-empty">No decisions match these filters yet.</div>';
+  }
+  const times = decisions.map((d) => new Date(d.created_at).getTime()).filter((t) => !Number.isNaN(t));
+  const min = Math.min(...times);
+  const max = Math.max(...times);
+  const range = Math.max(max - min, 1);
+  const rangeDays = Math.max(range / (1000 * 60 * 60 * 24), 1);
+  const width = Math.max(800, Math.round(rangeDays * 60) + 200);
+  const dotsHtml = decisions
+    .map((decision) => {
+      const createdAt = new Date(decision.created_at).getTime();
+      const ratio = (createdAt - min) / range;
+      const left = Math.round(ratio * (width - 80)) + 40;
+      const statusClass = DECISION_STATUS_CLASS[decision.status] || 'decision-gray';
+      const levelClass = `level-${decision.required_level}`;
+      return `
+        <button
+          class="decision-dot ${statusClass} ${levelClass}"
+          style="left:${left}px;"
+          data-decision-id="${decision.decision_id}"
+          data-created="${escapeHtml(decision.created_at)}"
+          aria-label="${escapeHtml(decision.title)}"
+        ></button>
+      `;
+    })
+    .join('');
+  return `
+    <div class="decision-timeline">
+      <div class="decision-track" style="width:${width}px;">
+        <div class="decision-line"></div>
+        ${dotsHtml}
+      </div>
+    </div>
+  `;
+};
+
+const renderDecisionsSection = () => {
+  const count = state.decisions.length;
+  const statusOptions = [
+    { value: 'all', label: 'All statuses' },
+    ...Object.keys(DECISION_STATUS_CLASS).map((status) => ({
+      value: status,
+      label: formatStatusLabel(status),
+    })),
+  ]
+    .map(
+      (option) =>
+        `<option value="${option.value}" ${state.decisionStatusFilter === option.value ? 'selected' : ''}>${option.label}</option>`
+    )
+    .join('');
+  return `
+    <section class="decisions-section" id="decisions-card">
+      <div class="section-header">
+        <div>
+          <h3>Decisions Timeline</h3>
+          <p>${count} decision${count === 1 ? '' : 's'} tracked for this project.</p>
+        </div>
+        <label class="status-filter">
+          <span>Status</span>
+          <select id="decision-status-filter">${statusOptions}</select>
+        </label>
+      </div>
+      ${renderDecisionTimeline(state.decisions)}
+      <div class="decision-legend">
+        <span><span class="legend-dot decision-green"></span> Accepted</span>
+        <span><span class="legend-dot decision-gray"></span> Proposed</span>
+        <span><span class="legend-dot decision-red"></span> Rejected</span>
+        <span><span class="legend-dot decision-yellow"></span> Deprecated</span>
+        <span><span class="legend-dot decision-blue"></span> Superseded</span>
+      </div>
+    </section>
+  `;
+};
+
 const renderTree = (nodes) => {
   if (!nodes || !nodes.length) return '';
   return `
@@ -602,6 +745,9 @@ const renderNodeDetails = (node) => {
         ${node.dueDate ? `<span>Due: ${node.dueDate}</span>` : ''}
         <span>Own: ${formatHours(node.expectedHours)}h</span>
         <span>Total: ${formatHours(node.totalHours ?? node.expectedHours)}h</span>
+      </div>
+      <div class="node-links">
+        <button class="button tiny secondary" data-action="view-milestone-decisions" data-slug="${node.slug}">View decisions</button>
       </div>
       ${node.description ? `<p class="node-description">${escapeHtml(node.description)}</p>` : ''}
       ${renderLogsSection(node)}
@@ -759,6 +905,82 @@ const renderHistoryModal = () => {
   `;
 };
 
+const renderDecisionDetailModal = (detail) => {
+  const overrides = detail.overrides?.length
+    ? detail.overrides.map((item) => `<li>#${item.decision_id} — ${escapeHtml(item.title)}</li>`).join('')
+    : '<li>None</li>';
+  const overriddenBy = detail.overridden_by?.length
+    ? detail.overridden_by.map((item) => `<li>#${item.decision_id} — ${escapeHtml(item.title)}</li>`).join('')
+    : '<li>None</li>';
+  const milestoneGroups = detail.milestones || {};
+  const milestoneHtml = Object.keys(milestoneGroups).length
+    ? Object.entries(milestoneGroups)
+        .map(([relation, items]) => {
+          const rows = items
+            .map(
+              (item) =>
+                `<li>${escapeHtml(item.title)} (${escapeHtml(item.slug)})${item.note ? ` — ${escapeHtml(item.note)}` : ''}</li>`
+            )
+            .join('');
+          return `
+            <div class="decision-rel-group">
+              <h4>${formatStatusLabel(relation)}</h4>
+              <ul>${rows}</ul>
+            </div>
+          `;
+        })
+        .join('')
+    : '<div class="decision-rel-group"><h4>Milestones</h4><ul><li>None</li></ul></div>';
+  const tags = detail.tags ? escapeHtml(detail.tags) : 'None';
+  return `
+    <button class="modal-close" data-action="close-modal">×</button>
+    <div class="decision-modal-header">
+      <h3>${escapeHtml(detail.title)}</h3>
+      <div class="decision-meta">
+        <span class="status-pill ${DECISION_STATUS_CLASS[detail.status] || 'decision-gray'}">${formatStatusLabel(detail.status)}</span>
+        <span>Required L${detail.required_level}</span>
+        <span>Maker ${escapeHtml(detail.maker)} (L${detail.maker_level})</span>
+        <span>${formatDateTime(detail.created_at)}</span>
+      </div>
+    </div>
+    <div class="decision-modal-body">
+      <section>
+        <h4>Context</h4>
+        <p>${escapeHtml(detail.context || 'Not recorded.')}</p>
+      </section>
+      <section>
+        <h4>Decision</h4>
+        <p>${escapeHtml(detail.decision || '')}</p>
+      </section>
+      <section>
+        <h4>Alternatives</h4>
+        <p>${escapeHtml(detail.alternatives || 'Not recorded.')}</p>
+      </section>
+      <section>
+        <h4>Consequences</h4>
+        <p>${escapeHtml(detail.consequences || 'Not recorded.')}</p>
+      </section>
+      <section>
+        <h4>Tags</h4>
+        <p>${tags}</p>
+      </section>
+      <section class="decision-relations">
+        <div>
+          <h4>Overrides</h4>
+          <ul>${overrides}</ul>
+        </div>
+        <div>
+          <h4>Overridden By</h4>
+          <ul>${overriddenBy}</ul>
+        </div>
+      </section>
+      <section class="decision-milestones">
+        ${milestoneHtml}
+      </section>
+    </div>
+  `;
+};
+
 const formField = (label, control) => `
   <div class="form-field">
     ${label ? `<label>${label}</label>` : ''}
@@ -908,6 +1130,16 @@ const handleViewHistory = async () => {
   openModal(renderHistoryModal());
 };
 
+const openDecisionDetail = async (decisionId) => {
+  if (!state.currentProject) return;
+  try {
+    const detail = await fetchJSON(`/api/decisions/${decisionId}?project=${encodeURIComponent(state.currentProject)}`);
+    openModal(renderDecisionDetailModal(detail));
+  } catch (error) {
+    showToast(error.message);
+  }
+};
+
 const handleLogSubmit = async (event, isEdit) => {
   event.preventDefault();
   if (!state.currentProject) {
@@ -956,9 +1188,11 @@ sidebarEl.addEventListener('click', async (event) => {
     window.history.pushState({}, '', url);
     // Reset change tracking for new project
     state.lastChangeIds = new Set();
+    state.decisionStatusFilter = 'all';
     // Load project data
     await loadMilestones();
     await loadRecentChanges(true); // silent on project switch
+    await loadDecisions();
     state.snapshots = [];
     renderSidebar(); // Re-render sidebar to update active state
     renderMain();
@@ -972,6 +1206,15 @@ sidebarEl.addEventListener('click', async (event) => {
 });
 
 mainEl.addEventListener('click', (event) => {
+  const decisionDot = event.target.closest('.decision-dot');
+  if (decisionDot) {
+    const decisionId = Number(decisionDot.dataset.decisionId);
+    if (!Number.isNaN(decisionId)) {
+      openDecisionDetail(decisionId);
+    }
+    return;
+  }
+
   // Handle milestone link clicks from recent changes (check target or closest parent)
   const milestoneLink = event.target.closest('.change-milestone-link');
   if (milestoneLink) {
@@ -1076,6 +1319,26 @@ mainEl.addEventListener('click', (event) => {
     }
     openModal(logFormTemplate(slug, log));
     $('#log-form').addEventListener('submit', (evt) => handleLogSubmit(evt, true));
+  } else if (action === 'view-milestone-decisions') {
+    const decisionsCard = document.getElementById('decisions-card');
+    if (decisionsCard) {
+      decisionsCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+});
+
+mainEl.addEventListener('mouseover', (event) => {
+  const dot = event.target.closest('.decision-dot');
+  if (!dot) return;
+  const decisionId = Number(dot.dataset.decisionId);
+  if (Number.isNaN(decisionId)) return;
+  const decision = findDecisionById(decisionId);
+  showDecisionTooltip(decision, dot);
+});
+
+mainEl.addEventListener('mouseout', (event) => {
+  if (event.target.closest('.decision-dot')) {
+    hideDecisionTooltip();
   }
 });
 
@@ -1104,6 +1367,10 @@ mainEl.addEventListener('change', (event) => {
   if (event.target.id === 'status-filter') {
     state.statusFilter = event.target.value;
     loadMilestones().then(renderMain);
+  }
+  if (event.target.id === 'decision-status-filter') {
+    state.decisionStatusFilter = event.target.value;
+    loadDecisions().then(renderMain);
   }
 });
 
@@ -1136,6 +1403,7 @@ const stopRecentChangesPolling = () => {
   if (state.currentProject) {
     await loadMilestones();
     await loadRecentChanges(true); // true = silent on first load
+    await loadDecisions();
   }
   renderSidebar();
   renderMain();

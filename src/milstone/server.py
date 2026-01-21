@@ -22,6 +22,9 @@ STATIC_FOLDER = BASE_DIR / "static"
 TEMPLATE_FOLDER = BASE_DIR / "templates"
 DB_FILENAME = "milstone.db"
 DEFAULT_EXPECTED_HOURS = 1.0
+DECISION_POLICY_FILENAME = "decision_policy.yml"
+DECISION_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
+DECISION_RELATION_TYPES = {"made_for", "affects", "implements", "blocked_by"}
 # Project registry is now handled by state.load_history() / state.save_history()
 # No need for separate in-memory registry
 
@@ -76,6 +79,66 @@ def _maybe_add_column(conn: sqlite3.Connection, table: str, column: str, column_
     if not _column_exists(conn, table, column):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_sql}")
         conn.commit()
+
+
+def _decision_policy_path(state_dir: Path) -> Path:
+    return state_dir / DECISION_POLICY_FILENAME
+
+
+def _load_decision_policy(state_dir: Path) -> Dict[str, int]:
+    path = _decision_policy_path(state_dir)
+    if not path.exists():
+        return {}
+    users: Dict[str, int] = {}
+    in_users = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("users:"):
+            in_users = True
+            continue
+        if not in_users:
+            continue
+        if line and not line.startswith((" ", "\t")):
+            in_users = False
+            continue
+        if ":" not in stripped:
+            continue
+        name, value = stripped.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        try:
+            level = int(value)
+        except ValueError:
+            continue
+        users[name] = level
+    return users
+
+
+def _maker_level_for(state_dir: Path, maker: str) -> int:
+    policy = _load_decision_policy(state_dir)
+    level = policy.get(maker, 1)
+    if level < 1 or level > 4:
+        raise ValueError(f"Invalid authority level {level} for maker '{maker}' in decision policy.")
+    return level
+
+
+def _decision_status(value: Optional[str]) -> str:
+    status = (value or "accepted").strip().lower()
+    if status not in DECISION_STATUSES:
+        raise ValueError(f"Invalid decision status '{status}'.")
+    return status
+
+
+def _relation_type(value: Optional[str]) -> str:
+    relation = (value or "made_for").strip().lower()
+    if relation not in DECISION_RELATION_TYPES:
+        raise ValueError(f"Invalid relation type '{relation}'.")
+    return relation
 
 
 def _normalize_statuses(conn: sqlite3.Connection) -> None:
@@ -169,6 +232,107 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             sequence INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS decisions (
+            decision_id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'accepted'
+                CHECK(status IN ('proposed','accepted','rejected','deprecated','superseded')),
+            required_level INTEGER NOT NULL,
+            maker TEXT NOT NULL,
+            maker_level INTEGER NOT NULL,
+            context TEXT,
+            decision TEXT NOT NULL,
+            alternatives TEXT,
+            consequences TEXT,
+            tags TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS decision_overrides (
+            overriding_decision_id INTEGER NOT NULL,
+            overridden_decision_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (overriding_decision_id, overridden_decision_id),
+            CHECK (overriding_decision_id <> overridden_decision_id),
+            FOREIGN KEY (overriding_decision_id) REFERENCES decisions(decision_id) ON DELETE CASCADE,
+            FOREIGN KEY (overridden_decision_id) REFERENCES decisions(decision_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS milestone_decisions (
+            milestone_id INTEGER NOT NULL REFERENCES milestones(id) ON DELETE CASCADE,
+            decision_id INTEGER NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,
+            relation_type TEXT NOT NULL DEFAULT 'made_for'
+                CHECK(relation_type IN ('made_for','affects','implements','blocked_by')),
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (milestone_id, decision_id, relation_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS decision_override_requests (
+            request_id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            requester TEXT NOT NULL,
+            requester_level INTEGER NOT NULL,
+            target_decision_id INTEGER NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,
+            message TEXT NOT NULL,
+            proposed_summary TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','approved','rejected')),
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);
+        CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+        CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at);
+        CREATE INDEX IF NOT EXISTS idx_overrides_overriding ON decision_overrides(overriding_decision_id);
+        CREATE INDEX IF NOT EXISTS idx_overrides_overridden ON decision_overrides(overridden_decision_id);
+        CREATE INDEX IF NOT EXISTS idx_milestone_decisions_mid ON milestone_decisions(milestone_id);
+        CREATE INDEX IF NOT EXISTS idx_milestone_decisions_did ON milestone_decisions(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_decision_override_requests_project ON decision_override_requests(project_id);
+        CREATE INDEX IF NOT EXISTS idx_decision_override_requests_status ON decision_override_requests(status);
+
+        CREATE TRIGGER IF NOT EXISTS trg_override_authority
+        BEFORE INSERT ON decision_overrides
+        BEGIN
+            SELECT CASE
+                WHEN (SELECT maker_level FROM decisions WHERE decision_id = NEW.overriding_decision_id)
+                   <= (SELECT required_level FROM decisions WHERE decision_id = NEW.overridden_decision_id)
+                THEN RAISE(ABORT, 'Insufficient authority to override this decision')
+            END;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_override_no_cycles
+        BEFORE INSERT ON decision_overrides
+        BEGIN
+            WITH RECURSIVE chain(id) AS (
+                SELECT NEW.overridden_decision_id
+                UNION ALL
+                SELECT o.overridden_decision_id
+                FROM decision_overrides o
+                JOIN chain c ON o.overriding_decision_id = c.id
+            )
+            SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM chain WHERE id = NEW.overriding_decision_id)
+                THEN RAISE(ABORT, 'Override cycle detected')
+            END;
+        END;
+
+        CREATE VIEW IF NOT EXISTS active_decisions AS
+        SELECT d.*
+        FROM decisions d
+        WHERE d.status = 'accepted'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM decision_overrides o
+            JOIN decisions newer ON newer.decision_id = o.overriding_decision_id
+            WHERE o.overridden_decision_id = d.decision_id
+              AND newer.status = 'accepted'
+          );
         """
     )
     _maybe_add_column(conn, "milestones", "parent_id", "parent_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL")
@@ -421,6 +585,149 @@ def _attach_logs(conn: sqlite3.Connection, node_map: Dict[int, dict]) -> None:
         node_map[row["milestone_id"]]["logs"].append(log)
 
 
+def _decision_row_to_compact(row: sqlite3.Row) -> dict:
+    return {
+        "decision_id": row["decision_id"],
+        "title": row["title"],
+        "status": row["status"],
+        "required_level": row["required_level"],
+        "maker": row["maker"],
+        "maker_level": row["maker_level"],
+        "created_at": row["created_at"],
+        "override_counts": {
+            "overrides": row["overrides_count"],
+            "overridden_by": row["overridden_by_count"],
+        },
+        "linked_milestones": row["linked_milestones"],
+    }
+
+
+def _list_decisions(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    status: Optional[List[str]] = None,
+    required_level: Optional[int] = None,
+    maker: Optional[str] = None,
+    milestone_id: Optional[int] = None,
+    search: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+) -> List[dict]:
+    params: List[object] = [project_id]
+    where_clauses = ["d.project_id = ?"]
+    if status:
+        placeholders = ",".join("?" for _ in status)
+        where_clauses.append(f"d.status IN ({placeholders})")
+        params.extend([_decision_status(value) for value in status])
+    if required_level:
+        where_clauses.append("d.required_level = ?")
+        params.append(required_level)
+    if maker:
+        where_clauses.append("d.maker = ?")
+        params.append(maker)
+    if search:
+        where_clauses.append("(d.title LIKE ? OR d.tags LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    if from_date:
+        where_clauses.append("d.created_at >= ?")
+        params.append(from_date)
+    if to_date:
+        where_clauses.append("d.created_at <= ?")
+        params.append(to_date)
+
+    join_clause = ""
+    if milestone_id is not None:
+        join_clause = "JOIN milestone_decisions md ON md.decision_id = d.decision_id"
+        where_clauses.append("md.milestone_id = ?")
+        params.append(milestone_id)
+
+    query = f"""
+        SELECT DISTINCT d.*,
+            (SELECT COUNT(*) FROM decision_overrides o WHERE o.overriding_decision_id = d.decision_id) AS overrides_count,
+            (SELECT COUNT(*) FROM decision_overrides o WHERE o.overridden_decision_id = d.decision_id) AS overridden_by_count,
+            (SELECT COUNT(DISTINCT milestone_id) FROM milestone_decisions md2 WHERE md2.decision_id = d.decision_id) AS linked_milestones
+        FROM decisions d
+        {join_clause}
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY d.created_at ASC
+    """
+    rows = conn.execute(query, params).fetchall()
+    return [_decision_row_to_compact(row) for row in rows]
+
+
+def _decision_detail(conn: sqlite3.Connection, project_id: int, decision_id: int) -> dict:
+    decision = conn.execute(
+        "SELECT * FROM decisions WHERE project_id = ? AND decision_id = ?",
+        (project_id, decision_id),
+    ).fetchone()
+    if decision is None:
+        raise ValueError("Decision not found")
+    overrides = conn.execute(
+        """
+        SELECT d.decision_id, d.title, d.status
+        FROM decision_overrides o
+        JOIN decisions d ON d.decision_id = o.overridden_decision_id
+        WHERE o.overriding_decision_id = ?
+        ORDER BY d.decision_id
+        """,
+        (decision_id,),
+    ).fetchall()
+    overridden_by = conn.execute(
+        """
+        SELECT d.decision_id, d.title, d.status
+        FROM decision_overrides o
+        JOIN decisions d ON d.decision_id = o.overriding_decision_id
+        WHERE o.overridden_decision_id = ?
+        ORDER BY d.decision_id
+        """,
+        (decision_id,),
+    ).fetchall()
+    milestone_rows = conn.execute(
+        """
+        SELECT md.relation_type, m.slug, m.title, md.note
+        FROM milestone_decisions md
+        JOIN milestones m ON m.id = md.milestone_id
+        WHERE md.decision_id = ?
+        ORDER BY md.relation_type, m.slug
+        """,
+        (decision_id,),
+    ).fetchall()
+    milestones: Dict[str, List[dict]] = {}
+    for row in milestone_rows:
+        milestones.setdefault(row["relation_type"], []).append(
+            {
+                "slug": row["slug"],
+                "title": row["title"],
+                "note": row["note"],
+            }
+        )
+    return {
+        "decision_id": decision["decision_id"],
+        "title": decision["title"],
+        "status": decision["status"],
+        "required_level": decision["required_level"],
+        "maker": decision["maker"],
+        "maker_level": decision["maker_level"],
+        "context": decision["context"],
+        "decision": decision["decision"],
+        "alternatives": decision["alternatives"],
+        "consequences": decision["consequences"],
+        "tags": decision["tags"],
+        "created_at": decision["created_at"],
+        "updated_at": decision["updated_at"],
+        "overrides": [
+            {"decision_id": row["decision_id"], "title": row["title"], "status": row["status"]}
+            for row in overrides
+        ],
+        "overridden_by": [
+            {"decision_id": row["decision_id"], "title": row["title"], "status": row["status"]}
+            for row in overridden_by
+        ],
+        "milestones": milestones,
+    }
+
+
 def _create_milestone(conn: sqlite3.Connection, project_id: int, payload: dict) -> str:
     slug = _generate_slug(conn, project_id, payload.get("title", ""))
     parent_slug = payload.get("parentSlug")
@@ -538,6 +845,23 @@ def _soft_delete_milestone(conn: sqlite3.Connection, project_id: int, slug: str)
 
 def _reset_project_data(conn: sqlite3.Connection, project_id: int) -> None:
     with conn:
+        conn.execute(
+            "DELETE FROM decision_override_requests WHERE project_id = ?",
+            (project_id,),
+        )
+        conn.execute(
+            "DELETE FROM decision_overrides WHERE overriding_decision_id IN (SELECT decision_id FROM decisions WHERE project_id = ?)"
+            " OR overridden_decision_id IN (SELECT decision_id FROM decisions WHERE project_id = ?)",
+            (project_id, project_id),
+        )
+        conn.execute(
+            "DELETE FROM milestone_decisions WHERE decision_id IN (SELECT decision_id FROM decisions WHERE project_id = ?)",
+            (project_id,),
+        )
+        conn.execute(
+            "DELETE FROM decisions WHERE project_id = ?",
+            (project_id,),
+        )
         # remove dependent rows referencing project milestones
         conn.execute(
             "DELETE FROM milestone_updates WHERE milestone_id IN (SELECT id FROM milestones WHERE project_id = ?)",
@@ -743,6 +1067,312 @@ def api_milestones():
         conn.close()
 
     return jsonify(response)
+
+
+@app.get("/api/decisions")
+def api_decisions():
+    project_key = request.args.get("project")
+    if not project_key:
+        return ("Missing 'project' query parameter", 400)
+    try:
+        _, state_dir, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered. Run 'milstone project ui' first.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+
+    try:
+        status_param = request.args.get("status")
+        statuses = status_param.split(",") if status_param else None
+        required_level = request.args.get("required_level")
+        maker = request.args.get("maker")
+        milestone_slug = request.args.get("milestone")
+        search = request.args.get("search")
+        from_date = request.args.get("from")
+        to_date = request.args.get("to")
+        milestone_id = None
+        if milestone_slug:
+            milestone_row = conn.execute(
+                "SELECT id FROM milestones WHERE project_id = ? AND slug = ?",
+                (project["id"], milestone_slug),
+            ).fetchone()
+            if milestone_row is None:
+                return ("Milestone not found", 404)
+            milestone_id = milestone_row["id"]
+        level_value = int(required_level) if required_level else None
+        decisions = _list_decisions(
+            conn,
+            project["id"],
+            status=statuses,
+            required_level=level_value,
+            maker=maker,
+            milestone_id=milestone_id,
+            search=search,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        return jsonify(decisions)
+    except ValueError as exc:
+        return (str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.get("/api/decisions/<int:decision_id>")
+def api_decision_detail(decision_id: int):
+    project_key = request.args.get("project")
+    if not project_key:
+        return ("Missing 'project' query parameter", 400)
+    try:
+        _, _, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered. Run 'milstone project ui' first.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        detail = _decision_detail(conn, project["id"], decision_id)
+        return jsonify(detail)
+    except ValueError as exc:
+        return (str(exc), 404)
+    finally:
+        conn.close()
+
+
+@app.get("/api/milestones/decisions")
+def api_milestone_decisions():
+    project_key = request.args.get("project")
+    milestone_slug = request.args.get("slug")
+    if not project_key or not milestone_slug:
+        return ("Missing 'project' or 'slug' query parameter", 400)
+    try:
+        _, _, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered. Run 'milstone project ui' first.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        milestone_row = conn.execute(
+            "SELECT id FROM milestones WHERE project_id = ? AND slug = ?",
+            (project["id"], milestone_slug),
+        ).fetchone()
+        if milestone_row is None:
+            return ("Milestone not found", 404)
+        decisions = _list_decisions(conn, project["id"], milestone_id=milestone_row["id"])
+        return jsonify(decisions)
+    finally:
+        conn.close()
+
+
+@app.post("/api/decisions/create")
+def api_create_decision():
+    project_key = request.args.get("projectKey")
+    payload = request.get_json(force=True)
+    if not project_key:
+        return ("Missing projectKey", 400)
+    try:
+        _, state_dir, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        title = payload.get("title")
+        decision_text = payload.get("decision")
+        if not title or not decision_text:
+            return ("Missing title or decision", 400)
+        required_level = payload.get("required_level") or payload.get("requiredLevel")
+        if required_level is None:
+            return ("Missing required_level", 400)
+        required_level_int = int(required_level)
+        maker = payload.get("maker") or "unknown"
+        maker_level = _maker_level_for(state_dir, maker)
+        status_value = _decision_status(payload.get("status"))
+        relation_value = _relation_type(payload.get("relation_type") or payload.get("relationType"))
+        with conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO decisions (
+                    project_id, title, status, required_level, maker, maker_level,
+                    context, decision, alternatives, consequences, tags
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    title,
+                    status_value,
+                    required_level_int,
+                    maker,
+                    maker_level,
+                    payload.get("context"),
+                    decision_text,
+                    payload.get("alternatives"),
+                    payload.get("consequences"),
+                    payload.get("tags"),
+                ),
+            )
+            decision_id = cursor.lastrowid
+            milestone_slug = payload.get("milestoneSlug")
+            if milestone_slug:
+                milestone_row = conn.execute(
+                    "SELECT id FROM milestones WHERE project_id = ? AND slug = ?",
+                    (project["id"], milestone_slug),
+                ).fetchone()
+                if milestone_row is None:
+                    return ("Milestone not found", 404)
+                conn.execute(
+                    """
+                    INSERT INTO milestone_decisions (milestone_id, decision_id, relation_type, note)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        milestone_row["id"],
+                        decision_id,
+                        relation_value,
+                        payload.get("note"),
+                    ),
+                )
+        return jsonify({"status": "ok", "decision_id": decision_id})
+    except ValueError as exc:
+        return (str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.post("/api/decisions/link")
+def api_link_decision():
+    project_key = request.args.get("projectKey")
+    payload = request.get_json(force=True)
+    if not project_key:
+        return ("Missing projectKey", 400)
+    try:
+        _, _, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        decision_id = payload.get("decision_id") or payload.get("decisionId")
+        milestone_slug = payload.get("milestoneSlug")
+        if not decision_id or not milestone_slug:
+            return ("Missing decision id or milestone slug", 400)
+        relation_value = _relation_type(payload.get("relation_type") or payload.get("relationType"))
+        decision_row = conn.execute(
+            "SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id = ?",
+            (project["id"], decision_id),
+        ).fetchone()
+        if decision_row is None:
+            return ("Decision not found", 404)
+        milestone_row = conn.execute(
+            "SELECT id FROM milestones WHERE project_id = ? AND slug = ?",
+            (project["id"], milestone_slug),
+        ).fetchone()
+        if milestone_row is None:
+            return ("Milestone not found", 404)
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO milestone_decisions (milestone_id, decision_id, relation_type, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    milestone_row["id"],
+                    decision_id,
+                    relation_value,
+                    payload.get("note"),
+                ),
+            )
+        return jsonify({"status": "ok"})
+    except ValueError as exc:
+        return (str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.post("/api/decisions/override")
+def api_override_decision():
+    project_key = request.args.get("projectKey")
+    payload = request.get_json(force=True)
+    if not project_key:
+        return ("Missing projectKey", 400)
+    try:
+        _, _, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        overriding_id = payload.get("decision_id") or payload.get("decisionId")
+        overrides = payload.get("overrides") or []
+        if not overriding_id or not overrides:
+            return ("Missing decision id or overrides list", 400)
+        decision_row = conn.execute(
+            "SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id = ?",
+            (project["id"], overriding_id),
+        ).fetchone()
+        if decision_row is None:
+            return ("Decision not found", 404)
+        placeholders = ",".join("?" for _ in overrides)
+        rows = conn.execute(
+            f"SELECT decision_id FROM decisions WHERE project_id = ? AND decision_id IN ({placeholders})",
+            [project["id"], *overrides],
+        ).fetchall()
+        found = {row["decision_id"] for row in rows}
+        missing = [str(item) for item in overrides if item not in found]
+        if missing:
+            return (f"Override target(s) not found: {', '.join(missing)}", 404)
+        with conn:
+            for target_id in overrides:
+                conn.execute(
+                    "INSERT INTO decision_overrides (overriding_decision_id, overridden_decision_id) VALUES (?, ?)",
+                    (overriding_id, target_id),
+                )
+        return jsonify({"status": "ok"})
+    except ValueError as exc:
+        return (str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.post("/api/decisions/override-request")
+def api_request_override():
+    project_key = request.args.get("projectKey")
+    payload = request.get_json(force=True)
+    if not project_key:
+        return ("Missing projectKey", 400)
+    try:
+        _, state_dir, conn, project = _project_runtime(project_key)
+    except KeyError:
+        return ("Project not registered.", 404)
+    except FileNotFoundError as exc:
+        return (str(exc), 400)
+    try:
+        target_id = payload.get("target_decision_id") or payload.get("targetDecisionId")
+        message = payload.get("message")
+        requester = payload.get("requester") or "unknown"
+        if not target_id or not message:
+            return ("Missing target decision or message", 400)
+        requester_level = _maker_level_for(state_dir, requester)
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO decision_override_requests (
+                    project_id, requester, requester_level, target_decision_id, message, proposed_summary
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    requester,
+                    requester_level,
+                    target_id,
+                    message,
+                    payload.get("proposed_summary") or payload.get("proposedSummary"),
+                ),
+            )
+        return jsonify({"status": "ok"})
+    except ValueError as exc:
+        return (str(exc), 400)
+    finally:
+        conn.close()
 
 
 @app.post("/api/milestones/create")
