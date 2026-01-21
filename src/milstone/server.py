@@ -23,7 +23,7 @@ TEMPLATE_FOLDER = BASE_DIR / "templates"
 DB_FILENAME = "milstone.db"
 DEFAULT_EXPECTED_HOURS = 1.0
 DECISION_POLICY_FILENAME = "decision_policy.yml"
-DECISION_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
+DECISION_STATUSES = {"in_effect", "superseded", "inactive"}
 DECISION_RELATION_TYPES = {"made_for", "affects", "implements", "blocked_by"}
 # Project registry is now handled by state.load_history() / state.save_history()
 # No need for separate in-memory registry
@@ -128,7 +128,7 @@ def _maker_level_for(state_dir: Path, maker: str) -> int:
 
 
 def _decision_status(value: Optional[str]) -> str:
-    status = (value or "accepted").strip().lower()
+    status = (value or "in_effect").strip().lower()
     if status not in DECISION_STATUSES:
         raise ValueError(f"Invalid decision status '{status}'.")
     return status
@@ -145,6 +145,134 @@ def _normalize_statuses(conn: sqlite3.Connection) -> None:
     with conn:
         conn.execute("UPDATE milestones SET status = 'active' WHERE status = 'planned'")
         conn.execute("UPDATE milestones SET status = 'done' WHERE status = 'completed'")
+
+
+def _normalize_decision_statuses(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("UPDATE decisions SET status = 'in_effect' WHERE status = 'accepted'")
+        conn.execute("UPDATE decisions SET status = 'inactive' WHERE status IN ('proposed','rejected','deprecated')")
+
+
+def _decision_schema_needs_migration(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions'").fetchone()
+    if not row or not row[0]:
+        return False
+    sql = row[0].lower()
+    return "proposed" in sql and "in_effect" not in sql
+
+
+def _migrate_decisions_schema(conn: sqlite3.Connection) -> None:
+    if not _decision_schema_needs_migration(conn):
+        return
+    conn.execute("PRAGMA foreign_keys = OFF")
+    with conn:
+        conn.execute("DROP TABLE IF EXISTS decisions_new")
+        conn.execute("DROP TRIGGER IF EXISTS trg_override_authority")
+        conn.execute("DROP TRIGGER IF EXISTS trg_override_no_cycles")
+        conn.execute("DROP VIEW IF EXISTS active_decisions")
+        conn.execute(
+            """
+            CREATE TABLE decisions_new (
+                decision_id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'in_effect'
+                    CHECK(status IN ('in_effect','superseded','inactive')),
+                required_level INTEGER NOT NULL,
+                maker TEXT NOT NULL,
+                maker_level INTEGER NOT NULL,
+                context TEXT,
+                decision TEXT NOT NULL,
+                alternatives TEXT,
+                consequences TEXT,
+                tags TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO decisions_new (
+                decision_id, project_id, title, status, required_level, maker, maker_level,
+                context, decision, alternatives, consequences, tags, created_at, updated_at
+            )
+            SELECT
+                decision_id,
+                project_id,
+                title,
+                CASE
+                    WHEN status = 'accepted' THEN 'in_effect'
+                    WHEN status = 'superseded' THEN 'superseded'
+                    ELSE 'inactive'
+                END AS status,
+                required_level,
+                maker,
+                maker_level,
+                context,
+                decision,
+                alternatives,
+                consequences,
+                tags,
+                created_at,
+                updated_at
+            FROM decisions
+            """
+        )
+        conn.execute("DROP TABLE decisions")
+        conn.execute("ALTER TABLE decisions_new RENAME TO decisions")
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);
+            CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+            CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at);
+            CREATE INDEX IF NOT EXISTS idx_overrides_overriding ON decision_overrides(overriding_decision_id);
+            CREATE INDEX IF NOT EXISTS idx_overrides_overridden ON decision_overrides(overridden_decision_id);
+            CREATE INDEX IF NOT EXISTS idx_milestone_decisions_mid ON milestone_decisions(milestone_id);
+            CREATE INDEX IF NOT EXISTS idx_milestone_decisions_did ON milestone_decisions(decision_id);
+            CREATE INDEX IF NOT EXISTS idx_decision_override_requests_project ON decision_override_requests(project_id);
+            CREATE INDEX IF NOT EXISTS idx_decision_override_requests_status ON decision_override_requests(status);
+
+            CREATE TRIGGER IF NOT EXISTS trg_override_authority
+            BEFORE INSERT ON decision_overrides
+            BEGIN
+                SELECT CASE
+                    WHEN (SELECT maker_level FROM decisions WHERE decision_id = NEW.overriding_decision_id)
+                       <= (SELECT required_level FROM decisions WHERE decision_id = NEW.overridden_decision_id)
+                    THEN RAISE(ABORT, 'Insufficient authority to override this decision')
+                END;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_override_no_cycles
+            BEFORE INSERT ON decision_overrides
+            BEGIN
+                WITH RECURSIVE chain(id) AS (
+                    SELECT NEW.overridden_decision_id
+                    UNION ALL
+                    SELECT o.overridden_decision_id
+                    FROM decision_overrides o
+                    JOIN chain c ON o.overriding_decision_id = c.id
+                )
+                SELECT CASE
+                    WHEN EXISTS (SELECT 1 FROM chain WHERE id = NEW.overriding_decision_id)
+                    THEN RAISE(ABORT, 'Override cycle detected')
+                END;
+            END;
+
+            CREATE VIEW IF NOT EXISTS active_decisions AS
+            SELECT d.*
+            FROM decisions d
+            WHERE d.status = 'in_effect'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM decision_overrides o
+                JOIN decisions newer ON newer.decision_id = o.overriding_decision_id
+                WHERE o.overridden_decision_id = d.decision_id
+                  AND newer.status = 'in_effect'
+              );
+            """
+        )
+    conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _ensure_log_sequences(conn: sqlite3.Connection) -> None:
@@ -237,8 +365,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             decision_id INTEGER PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'accepted'
-                CHECK(status IN ('proposed','accepted','rejected','deprecated','superseded')),
+            status TEXT NOT NULL DEFAULT 'in_effect'
+                CHECK(status IN ('in_effect','superseded','inactive')),
             required_level INTEGER NOT NULL,
             maker TEXT NOT NULL,
             maker_level INTEGER NOT NULL,
@@ -325,22 +453,24 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE VIEW IF NOT EXISTS active_decisions AS
         SELECT d.*
         FROM decisions d
-        WHERE d.status = 'accepted'
+        WHERE d.status = 'in_effect'
           AND NOT EXISTS (
             SELECT 1
             FROM decision_overrides o
             JOIN decisions newer ON newer.decision_id = o.overriding_decision_id
             WHERE o.overridden_decision_id = d.decision_id
-              AND newer.status = 'accepted'
+              AND newer.status = 'in_effect'
           );
         """
     )
+    _migrate_decisions_schema(conn)
     _maybe_add_column(conn, "milestones", "parent_id", "parent_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL")
     _maybe_add_column(conn, "milestones", "deleted", "deleted INTEGER NOT NULL DEFAULT 0")
     _maybe_add_column(conn, "milestones", "expected_hours", "expected_hours REAL NOT NULL DEFAULT 1")
     _maybe_add_column(conn, "milestone_updates", "sequence", "sequence INTEGER")
     _ensure_log_sequences(conn)
     _normalize_statuses(conn)
+    _normalize_decision_statuses(conn)
     _migrate_old_project_keys(conn)
 
 
@@ -1057,6 +1187,7 @@ def api_milestones():
                 "key": project["key"],
                 "name": project["name"],
                 "description": project["description"],
+                "createdAt": project["created_at"],
                 "path": entry.get("path"),
             },
             "milestones": milestones,

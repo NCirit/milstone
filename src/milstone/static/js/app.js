@@ -12,6 +12,8 @@ const state = {
   progress: null,
   decisions: [],
   decisionStatusFilter: 'all',
+  decisionZoom: 1,
+  projectMeta: null,
   expanded: new Set(),
   statusFilter: 'all',
   recentChanges: [],
@@ -55,11 +57,9 @@ const STATUS_COLOR_CLASS = {
   deleted: 'status-gray',
 };
 const DECISION_STATUS_CLASS = {
-  proposed: 'decision-gray',
-  accepted: 'decision-green',
-  rejected: 'decision-red',
-  deprecated: 'decision-yellow',
+  in_effect: 'decision-green',
   superseded: 'decision-blue',
+  inactive: 'decision-gray',
 };
 
 const canonicalStatusValue = (value) => {
@@ -337,6 +337,7 @@ const loadMilestones = async (silent = false) => {
   annotateTotals(state.milestones);
   pruneExpanded();
   state.progress = data.progress || null;
+  state.projectMeta = data.project || null;
   state.lastMilestoneHash = newHash;
 };
 
@@ -490,6 +491,11 @@ const renderMain = () => {
     </section>
     ${content}
   `;
+
+  const timeline = mainEl.querySelector('.decision-timeline[data-scroll-end="true"]');
+  if (timeline) {
+    timeline.scrollLeft = timeline.scrollWidth;
+  }
 };
 
 function renderProgressSection(percent) {
@@ -624,36 +630,91 @@ function renderMilestoneSection(tree) {
 
 const renderDecisionTimeline = (decisions) => {
   if (!decisions.length) {
-    return '<div class="node node-empty">No decisions match these filters yet.</div>';
+    return `
+      <div class="decision-timeline">
+        <div class="decision-track" style="width:100%;">
+          <div class="decision-line"></div>
+        </div>
+      </div>
+    `;
   }
   const times = decisions.map((d) => new Date(d.created_at).getTime()).filter((t) => !Number.isNaN(t));
+  const projectStart = state.projectMeta?.createdAt ? new Date(state.projectMeta.createdAt).getTime() : null;
+  if (projectStart && !Number.isNaN(projectStart)) {
+    times.push(projectStart);
+  }
   const min = Math.min(...times);
   const max = Math.max(...times);
   const range = Math.max(max - min, 1);
   const rangeDays = Math.max(range / (1000 * 60 * 60 * 24), 1);
-  const width = Math.max(800, Math.round(rangeDays * 60) + 200);
-  const dotsHtml = decisions
-    .map((decision) => {
+  const padding = 40;
+  const pixelsPerDay = 60 * state.decisionZoom;
+  const minSpacing = 60;
+  const maxSpacing = 220;
+  const widthByCount = Math.max(0, decisions.length - 1) * minSpacing + padding * 2;
+  let width = Math.max(480 * state.decisionZoom, Math.round(rangeDays * pixelsPerDay) + padding * 2, widthByCount);
+  const positions = decisions.map((decision) => {
       const createdAt = new Date(decision.created_at).getTime();
       const ratio = (createdAt - min) / range;
-      const left = Math.round(ratio * (width - 80)) + 40;
+      const left = Math.round(ratio * (width - padding * 2)) + padding;
+      return { decision, left };
+    });
+  const sorted = [...positions].sort((a, b) => a.left - b.left);
+  for (let i = 1; i < sorted.length; i += 1) {
+    const minLeft = sorted[i - 1].left + minSpacing;
+    if (sorted[i].left < minLeft) {
+      sorted[i].left = minLeft;
+    }
+  }
+  const capSpacing = Math.max(minSpacing, maxSpacing);
+  for (let i = 1; i < sorted.length; i += 1) {
+    const maxLeft = sorted[i - 1].left + capSpacing;
+    if (sorted[i].left > maxLeft) {
+      sorted[i].left = maxLeft;
+    }
+  }
+  let closestSpacing = Infinity;
+  for (let i = 1; i < sorted.length; i += 1) {
+    closestSpacing = Math.min(closestSpacing, sorted[i].left - sorted[i - 1].left);
+  }
+  const lastLeft = sorted[sorted.length - 1]?.left ?? padding;
+  width = Math.max(width, lastLeft + padding);
+  const showTicks = closestSpacing >= 60;
+  const dotsHtml = positions
+    .map(({ decision, left }) => {
       const statusClass = DECISION_STATUS_CLASS[decision.status] || 'decision-gray';
       const levelClass = `level-${decision.required_level}`;
+      const tilt = -20;
+      const labelShift = -16;
       return `
-        <button
-          class="decision-dot ${statusClass} ${levelClass}"
-          style="left:${left}px;"
-          data-decision-id="${decision.decision_id}"
-          data-created="${escapeHtml(decision.created_at)}"
-          aria-label="${escapeHtml(decision.title)}"
-        ></button>
+        <div class="decision-marker" style="left:${left}px; --label-tilt:${tilt}deg; --label-shift:${labelShift}px;">
+          <button
+            class="decision-dot ${statusClass} ${levelClass}"
+            data-decision-id="${decision.decision_id}"
+            data-created="${escapeHtml(decision.created_at)}"
+            aria-label="${escapeHtml(decision.title)}"
+          ></button>
+          <span class="decision-label" title="${escapeHtml(decision.title)}">${escapeHtml(decision.title)}</span>
+        </div>
       `;
     })
     .join('');
+  let startMarker = '';
+  if (projectStart && !Number.isNaN(projectStart)) {
+    const ratio = (projectStart - min) / range;
+    const left = Math.round(ratio * (width - padding * 2)) + padding;
+    startMarker = `
+      <div class="decision-marker decision-marker--start" style="left:${left}px; --label-tilt:-20deg; --label-shift:-16px;">
+        <span class="decision-end-dot"></span>
+        <span class="decision-label" title="Project initialized">${formatDateTime(state.projectMeta.createdAt)}</span>
+      </div>
+    `;
+  }
   return `
-    <div class="decision-timeline">
+    <div class="decision-timeline ${showTicks ? '' : 'decision-timeline--dense'}" data-scroll-end="true">
       <div class="decision-track" style="width:${width}px;">
         <div class="decision-line"></div>
+        ${startMarker}
         ${dotsHtml}
       </div>
     </div>
@@ -664,10 +725,9 @@ const renderDecisionsSection = () => {
   const count = state.decisions.length;
   const statusOptions = [
     { value: 'all', label: 'All statuses' },
-    ...Object.keys(DECISION_STATUS_CLASS).map((status) => ({
-      value: status,
-      label: formatStatusLabel(status),
-    })),
+    { value: 'in_effect', label: 'In effect' },
+    { value: 'superseded', label: 'Superseded' },
+    { value: 'inactive', label: 'Inactive' },
   ]
     .map(
       (option) =>
@@ -681,18 +741,26 @@ const renderDecisionsSection = () => {
           <h3>Decisions Timeline</h3>
           <p>${count} decision${count === 1 ? '' : 's'} tracked for this project.</p>
         </div>
-        <label class="status-filter">
-          <span>Status</span>
-          <select id="decision-status-filter">${statusOptions}</select>
-        </label>
+        <div class="decision-controls">
+          <label class="status-filter">
+            <span>Status</span>
+            <select id="decision-status-filter">${statusOptions}</select>
+          </label>
+          <div class="decision-zoom">
+            <span>Zoom</span>
+            <div class="zoom-buttons">
+              <button type="button" class="button secondary tiny" data-action="zoom-out">-</button>
+              <button type="button" class="button secondary tiny" data-action="zoom-reset">Reset</button>
+              <button type="button" class="button secondary tiny" data-action="zoom-in">+</button>
+            </div>
+          </div>
+        </div>
       </div>
       ${renderDecisionTimeline(state.decisions)}
       <div class="decision-legend">
-        <span><span class="legend-dot decision-green"></span> Accepted</span>
-        <span><span class="legend-dot decision-gray"></span> Proposed</span>
-        <span><span class="legend-dot decision-red"></span> Rejected</span>
-        <span><span class="legend-dot decision-yellow"></span> Deprecated</span>
+        <span><span class="legend-dot decision-green"></span> In effect</span>
         <span><span class="legend-dot decision-blue"></span> Superseded</span>
+        <span><span class="legend-dot decision-gray"></span> Inactive</span>
       </div>
     </section>
   `;
@@ -1206,6 +1274,9 @@ sidebarEl.addEventListener('click', async (event) => {
 });
 
 mainEl.addEventListener('click', (event) => {
+  if (panState.justPanned) {
+    return;
+  }
   const decisionDot = event.target.closest('.decision-dot');
   if (decisionDot) {
     const decisionId = Number(decisionDot.dataset.decisionId);
@@ -1281,7 +1352,16 @@ mainEl.addEventListener('click', (event) => {
 
   const action = event.target.dataset.action;
   if (!action) return;
-  if (action === 'open-create') {
+  if (action === 'zoom-in') {
+    state.decisionZoom = Math.max(0.2, state.decisionZoom * 1.25);
+    renderMain();
+  } else if (action === 'zoom-out') {
+    state.decisionZoom = Math.max(0.2, state.decisionZoom / 1.25);
+    renderMain();
+  } else if (action === 'zoom-reset') {
+    state.decisionZoom = 1;
+    renderMain();
+  } else if (action === 'open-create') {
     openModal(createFormTemplate());
     $('#create-form').addEventListener('submit', handleCreate);
   } else if (action === 'open-reset') {
@@ -1348,6 +1428,67 @@ const renderStatusDot = (node) => {
   const label = formatStatusLabel(statusKey);
   return `<span class="status-dot ${className}" title="${label}"></span>`;
 };
+
+const panState = {
+  active: false,
+  startX: 0,
+  scrollLeft: 0,
+  moved: false,
+  justPanned: false,
+};
+
+mainEl.addEventListener('pointerdown', (event) => {
+  const timeline = event.target.closest('.decision-timeline');
+  if (!timeline) return;
+  if (event.target.closest('.decision-dot')) {
+    return;
+  }
+  panState.active = true;
+  panState.startX = event.clientX;
+  panState.scrollLeft = timeline.scrollLeft;
+  panState.moved = false;
+  timeline.classList.add('is-panning');
+  timeline.setPointerCapture?.(event.pointerId);
+});
+
+mainEl.addEventListener('pointermove', (event) => {
+  if (!panState.active) return;
+  const timeline = event.target.closest('.decision-timeline');
+  if (!timeline) return;
+  const delta = event.clientX - panState.startX;
+  if (!panState.moved && Math.abs(delta) > 6) {
+    panState.moved = true;
+  }
+  timeline.scrollLeft = panState.scrollLeft - delta;
+});
+
+const endPan = (event) => {
+  if (!panState.active) return;
+  const timeline = event.target.closest('.decision-timeline') || document.querySelector('.decision-timeline');
+  timeline?.classList.remove('is-panning');
+  if (panState.moved) {
+    panState.justPanned = true;
+    setTimeout(() => {
+      panState.justPanned = false;
+    }, 0);
+  }
+  panState.active = false;
+};
+
+mainEl.addEventListener('pointerup', endPan);
+mainEl.addEventListener('pointerleave', endPan);
+mainEl.addEventListener('pointercancel', endPan);
+
+mainEl.addEventListener(
+  'click',
+  (event) => {
+    if (panState.justPanned && event.target.closest('.decision-dot')) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  },
+  true
+);
 
 const renderDoneLabel = (node) => {
   return getStatusKey(node) === 'done' ? '<span class="status-chip">[DONE]</span> ' : '';

@@ -43,7 +43,7 @@ SERVER_MODULE_PATH = "milstone.server"
 DEFAULT_EXPECTED_HOURS = 1.0
 MILSTONE_SERVER_PORT = 8123  # Hardcoded port for Milstone server
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
-DECISION_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
+DECISION_STATUSES = {"in_effect", "superseded", "inactive"}
 DECISION_RELATION_TYPES = {"made_for", "affects", "implements", "blocked_by"}
 
 SCHEMA_SQL = """
@@ -131,8 +131,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     decision_id INTEGER PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'accepted'
-        CHECK(status IN ('proposed','accepted','rejected','deprecated','superseded')),
+    status TEXT NOT NULL DEFAULT 'in_effect'
+        CHECK(status IN ('in_effect','superseded','inactive')),
     required_level INTEGER NOT NULL,
     maker TEXT NOT NULL,
     maker_level INTEGER NOT NULL,
@@ -219,13 +219,13 @@ END;
 CREATE VIEW IF NOT EXISTS active_decisions AS
 SELECT d.*
 FROM decisions d
-WHERE d.status = 'accepted'
+WHERE d.status = 'in_effect'
   AND NOT EXISTS (
     SELECT 1
     FROM decision_overrides o
     JOIN decisions newer ON newer.decision_id = o.overriding_decision_id
     WHERE o.overridden_decision_id = d.decision_id
-      AND newer.status = 'accepted'
+      AND newer.status = 'in_effect'
   );
 """
 
@@ -260,12 +260,14 @@ def _migrate_old_project_keys(conn: sqlite3.Connection) -> None:
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
+    _migrate_decisions_schema(conn)
     _maybe_add_column(conn, "milestones", "parent_id", "parent_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL")
     _maybe_add_column(conn, "milestones", "deleted", "deleted INTEGER NOT NULL DEFAULT 0")
     _maybe_add_column(conn, "milestones", "expected_hours", "expected_hours REAL NOT NULL DEFAULT 1")
     _maybe_add_column(conn, "milestone_updates", "sequence", "sequence INTEGER")
     _ensure_log_sequences(conn)
     _normalize_statuses(conn)
+    _normalize_decision_statuses(conn)
     _migrate_old_project_keys(conn)
 
 
@@ -508,8 +510,86 @@ def _canonical_status(value: Optional[str]) -> str:
     return value
 
 
+def _decision_schema_needs_migration(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions'").fetchone()
+    if not row or not row[0]:
+        return False
+    sql = row[0].lower()
+    return "proposed" in sql and "in_effect" not in sql
+
+
+def _migrate_decisions_schema(conn: sqlite3.Connection) -> None:
+    if not _decision_schema_needs_migration(conn):
+        return
+    conn.execute("PRAGMA foreign_keys = OFF")
+    with conn:
+        conn.execute("DROP TABLE IF EXISTS decisions_new")
+        conn.execute("DROP TRIGGER IF EXISTS trg_override_authority")
+        conn.execute("DROP TRIGGER IF EXISTS trg_override_no_cycles")
+        conn.execute("DROP VIEW IF EXISTS active_decisions")
+        conn.execute(
+            """
+            CREATE TABLE decisions_new (
+                decision_id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'in_effect'
+                    CHECK(status IN ('in_effect','superseded','inactive')),
+                required_level INTEGER NOT NULL,
+                maker TEXT NOT NULL,
+                maker_level INTEGER NOT NULL,
+                context TEXT,
+                decision TEXT NOT NULL,
+                alternatives TEXT,
+                consequences TEXT,
+                tags TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO decisions_new (
+                decision_id, project_id, title, status, required_level, maker, maker_level,
+                context, decision, alternatives, consequences, tags, created_at, updated_at
+            )
+            SELECT
+                decision_id,
+                project_id,
+                title,
+                CASE
+                    WHEN status = 'accepted' THEN 'in_effect'
+                    WHEN status = 'superseded' THEN 'superseded'
+                    ELSE 'inactive'
+                END AS status,
+                required_level,
+                maker,
+                maker_level,
+                context,
+                decision,
+                alternatives,
+                consequences,
+                tags,
+                created_at,
+                updated_at
+            FROM decisions
+            """
+        )
+        conn.execute("DROP TABLE decisions")
+        conn.execute("ALTER TABLE decisions_new RENAME TO decisions")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA_SQL)
+
+
+def _normalize_decision_statuses(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("UPDATE decisions SET status = 'in_effect' WHERE status = 'accepted'")
+        conn.execute("UPDATE decisions SET status = 'inactive' WHERE status IN ('proposed','rejected','deprecated')")
+
+
 def _decision_status(value: Optional[str]) -> str:
-    status = (value or "accepted").strip().lower()
+    status = (value or "in_effect").strip().lower()
     if status not in DECISION_STATUSES:
         raise typer.BadParameter(f"Invalid decision status '{status}'.")
     return status
@@ -1282,7 +1362,7 @@ def decision_add(
     required_level: int = typer.Option(..., "--required-level", min=1, max=4, help="Required authority level (1-4)"),
     path: Path = typer.Option(Path("."), "--path", help="Project root containing .milstone"),
     maker: Optional[str] = typer.Option(None, "--maker", help="Decision maker (defaults to current user)"),
-    status: str = typer.Option("accepted", "--status", help="Decision status"),
+    status: str = typer.Option("in_effect", "--status", help="Decision status"),
     context: Optional[str] = typer.Option(None, "--context", help="Decision context"),
     alternatives: Optional[str] = typer.Option(None, "--alternatives", help="Alternatives considered"),
     consequences: Optional[str] = typer.Option(None, "--consequences", help="Decision consequences"),
